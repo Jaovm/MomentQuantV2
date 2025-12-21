@@ -23,7 +23,7 @@ st.set_page_config(
 
 @st.cache_data(ttl=3600*12)
 def fetch_market_data(tickers: list, start_date: str, end_date: str):
-    t_list = list(tickers)
+    t_list = list(dict.fromkeys(tickers)) # Remove duplicatas mantendo ordem
     if 'BOVA11.SA' not in t_list:
         t_list.append('BOVA11.SA')
     
@@ -44,9 +44,6 @@ def fetch_market_data(tickers: list, start_date: str, end_date: str):
             if t in raw_data.columns.levels[0]:
                  prices[t] = raw_data[t]['Adj Close']
                  volumes[t] = raw_data[t]['Volume']
-            elif t in raw_data.columns:
-                 prices[t] = raw_data['Adj Close']
-                 volumes[t] = raw_data['Volume']
 
         return prices.dropna(how='all'), volumes.dropna(how='all')
     except Exception as e:
@@ -67,13 +64,13 @@ def fetch_fundamentals(tickers: list) -> pd.DataFrame:
             info = ticker_obj.info
             
             sector = info.get('sector', 'Unknown')
-            if sector in ['Unknown', 'N/A'] and 'longName' in info:
-                 if 'Banco' in info['longName'] or 'Financeira' in info['longName']:
+            if sector in ['Unknown', 'N/A', None] and 'longName' in info:
+                 if any(word in info['longName'] for word in ['Banco', 'Financeira', 'Investimentos']):
                      sector = 'Financial Services'
             
             data.append({
                 'ticker': t,
-                'sector': sector,
+                'sector': sector if sector else 'Unknown',
                 'marketCap': info.get('marketCap', np.nan),
                 'forwardPE': info.get('forwardPE', np.nan),
                 'priceToBook': info.get('priceToBook', np.nan),
@@ -95,7 +92,7 @@ def fetch_fundamentals(tickers: list) -> pd.DataFrame:
     return pd.DataFrame(data).set_index('ticker')
 
 # ==============================================================================
-# MÓDULO 2: CÁLCULO DE FATORES (Math & Logic)
+# MÓDULO 2: CÁLCULO DE FATORES
 # ==============================================================================
 
 def compute_residual_momentum(price_df: pd.DataFrame, lookback=12, skip=1) -> pd.Series:
@@ -136,13 +133,11 @@ def compute_low_volatility_score(price_df: pd.DataFrame, lookback=252) -> pd.Ser
         if len(asset_rets) < lookback * 0.8: continue
         
         vol = asset_rets.std() * np.sqrt(252)
-        
         try:
             covariance = np.cov(asset_rets, market_rets)
             beta = covariance[0, 1] / covariance[1, 1]
         except:
             beta = 1.0
-            
         stats[ticker] = {'vol': vol, 'beta': beta}
         
     df_stats = pd.DataFrame(stats).T
@@ -160,26 +155,19 @@ def compute_fundamental_momentum(fund_df: pd.DataFrame) -> pd.Series:
     for m in metrics:
         if m in fund_df.columns:
             s = fund_df[m].fillna(fund_df[m].median())
-            temp_df[m] = (s - s.mean()) / s.std()
+            temp_df[m] = (s - s.mean()) / (s.std() + 1e-6)
     return temp_df.mean(axis=1).rename("Fundamental_Momentum")
 
 def compute_value_score(fund_df: pd.DataFrame) -> pd.Series:
     scores = pd.DataFrame(index=fund_df.index)
-    
-    if 'forwardPE' in fund_df: 
-        scores['EP'] = np.where(fund_df['forwardPE'] > 0, 1/fund_df['forwardPE'], 0)
-    
-    if 'priceToBook' in fund_df: 
-        scores['BP'] = np.where(fund_df['priceToBook'] > 0, 1/fund_df['priceToBook'], 0)
-        
-    if 'enterpriseToEbitda' in fund_df:
-        scores['EbitdaYield'] = np.where(fund_df['enterpriseToEbitda'] > 0, 1/fund_df['enterpriseToEbitda'], 0)
-        
-    if 'dividendYield' in fund_df:
-        scores['DY'] = fund_df['dividendYield'].fillna(0)
+    if 'forwardPE' in fund_df: scores['EP'] = np.where(fund_df['forwardPE'] > 0, 1/fund_df['forwardPE'], 0)
+    if 'priceToBook' in fund_df: scores['BP'] = np.where(fund_df['priceToBook'] > 0, 1/fund_df['priceToBook'], 0)
+    if 'enterpriseToEbitda' in fund_df: scores['EbitdaYield'] = np.where(fund_df['enterpriseToEbitda'] > 0, 1/fund_df['enterpriseToEbitda'], 0)
+    if 'dividendYield' in fund_df: scores['DY'] = fund_df['dividendYield'].fillna(0)
 
     for col in scores.columns:
-        scores[col] = (scores[col] - scores[col].mean()) / scores[col].std()
+        std = scores[col].std()
+        scores[col] = (scores[col] - scores[col].mean()) / (std if std > 0 else 1)
         
     return scores.mean(axis=1).rename("Value_Score")
 
@@ -194,10 +182,12 @@ def compute_size_score(fund_df: pd.DataFrame) -> pd.Series:
     if 'marketCap' not in fund_df.columns: return pd.Series(dtype=float)
     mcap = fund_df['marketCap'].replace(0, np.nan)
     log_mcap = np.log(mcap)
-    return (-1 * (log_mcap - log_mcap.mean()) / log_mcap.std()).rename("Size_Score")
+    # Normalizado para Z-Score para consistência
+    z_size = -1 * (log_mcap - log_mcap.mean()) / log_mcap.std()
+    return z_size.rename("Size_Score")
 
 # ==============================================================================
-# MÓDULO 3: SCORING & NORMALIZAÇÃO (Advanced)
+# MÓDULO 3: SCORING & NORMALIZAÇÃO
 # ==============================================================================
 
 def winsorize_series(series: pd.Series, limits=(0.01, 0.01)) -> pd.Series:
@@ -208,7 +198,7 @@ def winsorize_series(series: pd.Series, limits=(0.01, 0.01)) -> pd.Series:
 
 def normalize_factor(series: pd.Series, use_rank_based: bool = False) -> pd.Series:
     s = series.replace([np.inf, -np.inf], np.nan).dropna()
-    
+    if s.empty: return s
     if use_rank_based:
         ranks = s.rank(pct=True)
         return (ranks - 0.5) * 6
@@ -216,23 +206,21 @@ def normalize_factor(series: pd.Series, use_rank_based: bool = False) -> pd.Seri
         s_win = winsorize_series(s)
         median = s_win.median()
         mad = (s_win - median).abs().median()
-        if mad == 0 or mad < 1e-6: return s_win - median
+        if mad < 1e-6: return s_win - median
         z = (s_win - median) / (mad * 1.4826)
         return z.clip(-3, 3)
 
 def build_composite_score(df_master: pd.DataFrame, weights: dict, use_rank_based: bool) -> pd.DataFrame:
     df = df_master.copy()
     df['Composite_Score'] = 0.0
-    
     for col, weight in weights.items():
         if col in df.columns and weight > 0:
             df[col + '_Norm'] = normalize_factor(df[col], use_rank_based)
             df['Composite_Score'] += df[col + '_Norm'].fillna(0) * weight
-            
     return df.sort_values('Composite_Score', ascending=False)
 
 # ==============================================================================
-# MÓDULO 4: PORTFOLIO & OPTIMIZATION & BACKTEST
+# MÓDULO 4: PORTFOLIO & BACKTEST
 # ==============================================================================
 
 def enforce_constraints(weights: pd.Series, sector_series: pd.Series, 
@@ -241,27 +229,26 @@ def enforce_constraints(weights: pd.Series, sector_series: pd.Series,
     for _ in range(15):
         w = w.clip(upper=max_asset_weight)
         w = w / w.sum()
-        
-        if sector_series is not None and not sector_series.empty:
+        if sector_series is not None:
+            # Proteção contra tickers faltantes no Series de setores
+            valid_sectors = sector_series.reindex(w.index).fillna('Unknown')
             df_w = w.to_frame('weight')
-            df_w['sector'] = sector_series.reindex(w.index).fillna('Unknown')
+            df_w['sector'] = valid_sectors
             sector_weights = df_w.groupby('sector')['weight'].sum()
-            
             over_sectors = sector_weights[sector_weights > max_sector_weight].index
             if not over_sectors.empty:
                 for sec in over_sectors:
                     scale = max_sector_weight / sector_weights[sec]
                     tickers_in_sec = df_w[df_w['sector'] == sec].index
                     w.loc[tickers_in_sec] *= scale
-                
                 w = w / w.sum()
             else:
-                if (w <= max_asset_weight + 1e-4).all():
-                    break
+                if (w <= max_asset_weight + 1e-4).all(): break
     return w
 
 def optimize_portfolio(selected_tickers, cov_matrix, method='risk_parity'):
     n = len(selected_tickers)
+    if n == 0: return pd.Series()
     initial_weights = np.ones(n) / n
     bounds = tuple((0.0, 1.0) for _ in range(n))
     constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
@@ -269,413 +256,253 @@ def optimize_portfolio(selected_tickers, cov_matrix, method='risk_parity'):
     if method == 'risk_parity':
         def risk_parity_obj(w, cov):
             port_vol = np.sqrt(w.T @ cov @ w)
+            if port_vol <= 0: return 0
             mrc = (cov @ w) / port_vol
             rc = w * mrc
             target_rc = port_vol / n
             return np.sum((rc - target_rc)**2)
-            
-        res = minimize(risk_parity_obj, initial_weights, args=(cov_matrix), 
-                       method='SLSQP', bounds=bounds, constraints=constraints)
+        res = minimize(risk_parity_obj, initial_weights, args=(cov_matrix), method='SLSQP', bounds=bounds, constraints=constraints)
         return pd.Series(res.x, index=selected_tickers)
-    else:
-        return pd.Series(initial_weights, index=selected_tickers)
+    elif method == 'min_vol':
+        def min_vol_obj(w, cov): return np.sqrt(w.T @ cov @ w)
+        res = minimize(min_vol_obj, initial_weights, args=(cov_matrix), method='SLSQP', bounds=bounds, constraints=constraints)
+        return pd.Series(res.x, index=selected_tickers)
+    return pd.Series(initial_weights, index=selected_tickers)
 
-def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame, 
-                        config: dict, sector_series: pd.Series):
+def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame, config: dict, sector_series: pd.Series):
     top_n = config['top_n']
     selected = ranked_df.head(top_n).index.tolist()
     if not selected: return pd.Series()
     
-    recent_rets = prices[selected].pct_change().tail(252).dropna()
-    if recent_rets.empty or len(recent_rets) < 30:
-        return pd.Series(1.0/len(selected), index=selected)
+    recent_rets = prices[selected].pct_change().tail(252).dropna(how='all').fillna(0)
+    if recent_rets.empty: return pd.Series(1/len(selected), index=selected)
     cov_matrix = recent_rets.cov() * 252
 
     if config['method'] == 'risk_parity':
         raw_weights = optimize_portfolio(selected, cov_matrix.values, 'risk_parity')
     elif config['method'] == 'inverse_vol':
         vols = np.sqrt(np.diag(cov_matrix))
-        inv_vols = 1.0 / vols
+        inv_vols = 1.0 / np.where(vols > 0, vols, vols.mean() if vols.mean() > 0 else 1)
         raw_weights = pd.Series(inv_vols / inv_vols.sum(), index=selected)
     else:
         raw_weights = pd.Series(1.0/len(selected), index=selected)
 
-    final_weights = enforce_constraints(
-        raw_weights, 
-        sector_series, 
-        config['max_asset_pct'], 
-        config['max_sector_pct']
-    )
-    
-    return final_weights.sort_values(ascending=False)
+    return enforce_constraints(raw_weights, sector_series, config['max_asset_pct'], config['max_sector_pct'])
 
 def calculate_metrics(daily_returns: pd.Series, risk_free=0.10):
-    if daily_returns.empty: return {}
-    
+    if daily_returns.empty: return {k: 0.0 for k in ["Total Return", "Annualized Return", "Volatility", "Sharpe", "Sortino", "Calmar", "Max Drawdown"]}
     total_ret = (1 + daily_returns).prod() - 1
     ann_ret = (1 + total_ret) ** (252 / len(daily_returns)) - 1
     vol = daily_returns.std() * np.sqrt(252)
     sharpe = (ann_ret - risk_free) / vol if vol > 0 else 0
-    
     cum_ret = (1 + daily_returns).cumprod()
     peak = cum_ret.cummax()
-    drawdown = (cum_ret - peak) / peak
-    max_dd = drawdown.min()
-    
-    neg_rets = daily_returns[daily_returns < 0]
-    down_dev = neg_rets.std() * np.sqrt(252) if len(neg_rets) > 0 else vol
-    sortino = (ann_ret - risk_free) / down_dev if down_dev > 0 else 0
-    
-    calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0
-    
-    return {
-        "Total Return": total_ret,
-        "Annualized Return": ann_ret,
-        "Volatility": vol,
-        "Sharpe": sharpe,
-        "Sortino": sortino,
-        "Calmar": calmar,
-        "Max Drawdown": max_dd
-    }
+    max_dd = ((cum_ret - peak) / peak).min()
+    return {"Total Return": total_ret, "Annualized Return": ann_ret, "Volatility": vol, "Sharpe": sharpe, "Max Drawdown": max_dd}
 
-def run_backtest_engine(
-    prices: pd.DataFrame, 
-    fundamentals: pd.DataFrame, 
-    config: dict, 
-    volume_df: pd.DataFrame = None
-):
+def run_backtest_engine(prices: pd.DataFrame, fundamentals: pd.DataFrame, config: dict, volume_df: pd.DataFrame = None):
     start_date = config['start_date']
     end_date = prices.index[-1]
-    
     rebal_dates = prices.loc[start_date:end_date].resample('MS').first().index.tolist()
-    
     if not rebal_dates: return pd.Series()
 
     daily_rets = []
-    transaction_cost_pct = config.get('transaction_cost_pct', 0.002)
     prev_weights = pd.Series(dtype=float)
 
     for i, rebal_date in enumerate(rebal_dates):
         next_date = rebal_dates[i+1] if i < len(rebal_dates) - 1 else end_date
-        
         hist_prices = prices.loc[:rebal_date]
+        if len(hist_prices) < 60: continue
         
-        mom_window = hist_prices.tail(400)
-        res_mom = compute_residual_momentum(mom_window)
-        low_vol = compute_low_volatility_score(mom_window)
-        
-        fund_mom = compute_fundamental_momentum(fundamentals)
-        val_score = compute_value_score(fundamentals)
-        qual_score = compute_quality_score(fundamentals)
-        size_score = compute_size_score(fundamentals)
-        
-        liq_mask = pd.Series(True, index=prices.columns)
+        # Filtro Liquidez
+        valid_tickers = prices.columns.tolist()
         if volume_df is not None:
-            avg_vol = volume_df.loc[:rebal_date].tail(63).mean() * prices.loc[:rebal_date].tail(63).mean()
-            liq_mask = avg_vol > config['min_liquidity']
-            
-        valid_tickers = liq_mask[liq_mask].index.tolist()
-        valid_tickers = [t for t in valid_tickers if t != 'BOVA11.SA']
-
-        df_step = pd.DataFrame(index=valid_tickers)
-        df_step['Res_Mom'] = res_mom
-        df_step['Low_Vol'] = low_vol
-        df_step['Fund_Mom'] = fund_mom
-        df_step['Value'] = val_score
-        df_step['Quality'] = qual_score
-        df_step['Size'] = size_score
+            avg_vol_fin = (volume_df.loc[:rebal_date].tail(63) * prices.loc[:rebal_date].tail(63)).mean()
+            valid_tickers = avg_vol_fin[avg_vol_fin >= config['min_liquidity']].index.tolist()
         
-        if 'sector' in fundamentals.columns: 
-             df_step['Sector'] = fundamentals['sector']
-
+        valid_tickers = [t for t in valid_tickers if t != 'BOVA11.SA']
+        mom_window = hist_prices.tail(400)
+        
+        df_step = pd.DataFrame(index=valid_tickers)
+        df_step['Res_Mom'] = compute_residual_momentum(mom_window).reindex(valid_tickers)
+        df_step['Low_Vol'] = compute_low_volatility_score(mom_window).reindex(valid_tickers)
+        df_step['Fund_Mom'] = compute_fundamental_momentum(fundamentals).reindex(valid_tickers)
+        df_step['Value'] = compute_value_score(fundamentals).reindex(valid_tickers)
         df_step.dropna(thresh=2, inplace=True)
         
-        w_map = config['factor_weights']
-        ranked = build_composite_score(df_step, w_map, config['use_rank_based'])
+        ranked = build_composite_score(df_step, config['factor_weights'], config['use_rank_based'])
+        current_weights = construct_portfolio(ranked, hist_prices, config['portfolio_config'], fundamentals['sector'])
         
-        current_weights = construct_portfolio(
-            ranked, 
-            hist_prices, 
-            config['portfolio_config'],
-            sector_series=fundamentals['sector'] if 'sector' in fundamentals else None
-        )
-        
-        market_period = prices.loc[rebal_date:next_date].iloc[1:]
-        period_pct = market_period.pct_change().dropna(how='all')
-        
+        period_pct = prices.loc[rebal_date:next_date].iloc[1:].pct_change().dropna(how='all')
         if not current_weights.empty and not period_pct.empty:
-            common_tickers = list(set(current_weights.index) & set(period_pct.columns))
-            if not common_tickers:
-                daily_rets.append(pd.Series(0.0, index=period_pct.index))
-                continue
-            strat_ret = period_pct[common_tickers].dot(current_weights[common_tickers])
+            common = list(set(current_weights.index) & set(period_pct.columns))
+            strat_ret = period_pct[common].dot(current_weights[common])
             
-            turnover = 0.0
-            if prev_weights.empty:
-                turnover = 1.0
-            else:
-                all_tkrs = list(set(current_weights.index) | set(prev_weights.index))
-                w_curr = current_weights.reindex(all_tkrs).fillna(0)
-                w_prev = prev_weights.reindex(all_tkrs).fillna(0)
-                turnover = np.abs(w_curr - w_prev).sum() / 2
-            
-            cost = turnover * transaction_cost_pct
-            strat_ret.iloc[0] -= cost
+            # Turnover e Custos
+            all_tkrs = list(set(current_weights.index) | set(prev_weights.index))
+            turnover = np.abs(current_weights.reindex(all_tkrs).fillna(0) - prev_weights.reindex(all_tkrs).fillna(0)).sum() / 2
+            strat_ret.iloc[0] -= (turnover * config['transaction_cost_pct'])
             
             daily_rets.append(strat_ret)
             prev_weights = current_weights
-        else:
-            daily_rets.append(pd.Series(0.0, index=period_pct.index))
             
-    if daily_rets:
-        full_series = pd.concat(daily_rets)
-        full_series = full_series[~full_series.index.duplicated(keep='first')]
-        return full_series
-    return pd.Series()
+    return pd.concat(daily_rets) if daily_rets else pd.Series()
 
 # ==============================================================================
-# NOVO MÓDULO: GESTÃO DE CAPITAL E APORTES (DCA)
+# GESTÃO DE CAPITAL
 # ==============================================================================
-def calculate_dca_history(strategy_rets: pd.Series, initial_capital: float, monthly_investment: float):
-    """
-    Simula crescimento com aportes mensais no início do mês.
-    """
-    monthly_dates = strategy_rets.index.to_series().dt.is_month_start
+
+def calculate_dca_history(strategy_rets, initial_capital, monthly_investment):
+    if strategy_rets.empty: return pd.DataFrame()
+    # Identifica inícios de meses no índice real do backtest
+    monthly_dates = strategy_rets.index[strategy_rets.index.to_series().dt.is_month_start]
+    if monthly_dates.empty: # Fallback se não houver 'dia 1' exato (feriados)
+        monthly_dates = strategy_rets.resample('MS').first().index
+
     history = []
     current_balance = initial_capital
-    
-    for date, ret in strategy_rets.items():
-        if monthly_dates.loc[date]:
+    for date in strategy_rets.index:
+        if date in monthly_dates:
             current_balance += monthly_investment
-        current_balance *= (1 + ret)
+        current_balance *= (1 + strategy_rets.loc[date])
         history.append({'Date': date, 'Equity': current_balance})
-    
     return pd.DataFrame(history).set_index('Date')
 
 # ==============================================================================
-# APP PRINCIPAL (STREAMLIT UI)
+# APP PRINCIPAL
 # ==============================================================================
 
 def main():
     st.title("🧪 Quant Factor Lab Pro v2.0")
-    st.markdown("""
-    **Institutional-Grade Screener & Backtester for B3**  
-    Multifator, Risk Parity, Walk-Forward com custos, DCA e Plano de Execução.
-    """)
 
     with st.sidebar:
-        st.header("⚙️ Configuração do Universo")
+        st.header("⚙️ Configuração")
         default_univ = "ITUB3.SA, VALE3.SA, PETR4.SA, WEGE3.SA, PRIO3.SA, BBAS3.SA, RENT3.SA, B3SA3.SA, SUZB3.SA, GGBR4.SA, JBSS3.SA, RAIL3.SA, VIVT3.SA, CPLE6.SA, PSSA3.SA, TOTS3.SA, EQTL3.SA, LREN3.SA, RADL3.SA, CMIG4.SA"
-        ticker_input = st.text_area("Tickers (separados por vírgula)", default_univ, height=100)
+        ticker_input = st.text_area("Tickers (CSV)", default_univ, height=80)
         tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
         
         st.divider()
-        st.header("1. Definição de Alpha (Pesos)")
-        w_rm = st.slider("Residual Momentum", 0.0, 1.0, 0.30, 0.05)
-        w_lv = st.slider("Low Volatility / Beta", 0.0, 1.0, 0.20, 0.05)
-        w_fm = st.slider("Fundamental Momentum", 0.0, 1.0, 0.20, 0.05)
-        w_val = st.slider("Value (Enhanced)", 0.0, 1.0, 0.20, 0.05)
-        w_qual = st.slider("Quality", 0.0, 1.0, 0.10, 0.05)
-        w_size = st.slider("Size (Small Cap Bias)", 0.0, 1.0, 0.00, 0.05)
-        
-        total_weight = w_rm + w_lv + w_fm + w_val + w_qual + w_size
-        if total_weight > 0:
-            st.success(f"Peso total: {total_weight:.2f}")
-        else:
-            st.warning("Ajuste os pesos — soma deve ser > 0")
-        
         factor_weights = {
-            'Res_Mom': w_rm, 'Low_Vol': w_lv, 'Fund_Mom': w_fm, 
-            'Value': w_val, 'Quality': w_qual, 'Size': w_size
+            'Res_Mom': st.slider("Residual Momentum", 0.0, 1.0, 0.3),
+            'Low_Vol': st.slider("Low Volatility", 0.0, 1.0, 0.2),
+            'Fund_Mom': st.slider("Fundamental Momentum", 0.0, 1.0, 0.2),
+            'Value': st.slider("Value", 0.0, 1.0, 0.3),
+            'Quality': 0.0, 'Size': 0.0
         }
         
-        st.divider()
-        st.header("2. Normalização e Filtros")
-        use_rank_based = st.checkbox("Usar Rank-Based Scoring?", value=False)
-        min_liquidity = st.number_input("Liquidez Mínima Diária (R$)", value=3000000, step=500000, format="%d")
-        
-        st.divider()
-        st.header("3. Construção de Portfólio")
+        use_rank_based = st.checkbox("Rank-Based Scoring", value=False)
+        min_liquidity = st.number_input("Liquidez Mín. Diária (R$)", value=3000000)
         top_n = st.number_input("Top N Ativos", 5, 30, 10)
-        weight_method = st.selectbox("Método de Pesos", ["Inverse Volatility", "Risk Parity (Opt)", "Equal Weight"])
-        max_asset_cap = st.slider("Cap Máximo por Ativo (%)", 0.05, 0.50, 0.15, 0.01)
-        max_sector_cap = st.slider("Cap Máximo por Setor (%)", 0.10, 1.00, 0.35, 0.05)
+        weight_method = st.selectbox("Método de Pesos", ["Risk Parity (Opt)", "Inverse Volatility", "Equal Weight"])
         
         st.divider()
-        st.header("4. Parâmetros de Backtest")
-        trans_cost = st.slider("Custo de Transação (%)", 0.0, 1.0, 0.20, 0.05) / 100
+        capital_inicial = st.number_input("Capital Inicial (R$)", value=100000)
+        aporte_mensal = st.number_input("Aporte Mensal (R$)", value=2000)
         years_backtest = st.slider("Anos de Backtest", 1, 5, 3)
+        trans_cost = st.slider("Custo Transação (%)", 0.0, 1.0, 0.2) / 100
         
-        st.divider()
-        st.header("💰 Gestão de Capital")
-        capital_inicial = st.number_input("Capital Inicial (R$)", value=100000, step=10000, format="%d")
-        aporte_mensal = st.number_input("Aporte Mensal (R$)", value=2000, step=500, format="%d")
-        
-        run_btn = st.button("🚀 Executar Engine Quant", type="primary", use_container_width=True)
+        run_btn = st.button("🚀 Executar Engine", type="primary", use_container_width=True)
 
     if run_btn:
-        if not tickers:
-            st.error("Insira pelo menos um ticker válido.")
-            return
-        if total_weight == 0:
-            st.error("A soma dos pesos dos fatores deve ser maior que zero.")
-            return
-
-        with st.status("Processando Pipeline Quantitativo...", expanded=True) as status:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=365 * (years_backtest + 2))
+        with st.status("Processando Pipeline...", expanded=True) as status:
+            end_date_dt = datetime.now()
+            start_date_dt = end_date_dt - timedelta(days=365 * (years_backtest + 1))
             
-            st.write("📥 Baixando Preços e Volume...")
-            prices, volumes = fetch_market_data(tickers, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
-            
-            st.write("📊 Baixando Dados Fundamentais...")
+            prices, volumes = fetch_market_data(tickers, start_date_dt.strftime('%Y-%m-%d'), end_date_dt.strftime('%Y-%m-%d'))
             fundamentals = fetch_fundamentals(tickers)
             
             if prices.empty or fundamentals.empty:
-                st.error("Falha ao obter dados. Verifique os tickers ou conexão.")
-                status.update(label="Erro", state="error")
+                st.error("Dados insuficientes.")
                 return
 
-            st.write("🧮 Calculando Fatores Atuais...")
-            current_mom_prices = prices.tail(400)
-            
-            res_mom = compute_residual_momentum(current_mom_prices)
-            low_vol = compute_low_volatility_score(current_mom_prices)
-            fund_mom = compute_fundamental_momentum(fundamentals)
-            val_score = compute_value_score(fundamentals)
-            qual_score = compute_quality_score(fundamentals)
-            size_score = compute_size_score(fundamentals)
-            
-            df_current = pd.DataFrame(index=tickers)
-            df_current['Res_Mom'] = res_mom
-            df_current['Low_Vol'] = low_vol
-            df_current['Fund_Mom'] = fund_mom
-            df_current['Value'] = val_score
-            df_current['Quality'] = qual_score
-            df_current['Size'] = size_score
-            if 'sector' in fundamentals.columns:
-                df_current['Sector'] = fundamentals['sector']
-            
-            avg_liq = volumes.tail(63).mean() * prices.tail(63).mean()
-            liquid_tickers = avg_liq[avg_liq >= min_liquidity].index
-            df_current = df_current.loc[df_current.index.intersection(liquid_tickers)]
+            # Pipeline Atual
+            current_mom = prices.tail(400)
+            df_current = pd.DataFrame(index=fundamentals.index)
+            df_current['Res_Mom'] = compute_residual_momentum(current_mom)
+            df_current['Low_Vol'] = compute_low_volatility_score(current_mom)
+            df_current['Fund_Mom'] = compute_fundamental_momentum(fundamentals)
+            df_current['Value'] = compute_value_score(fundamentals)
             
             ranked_current = build_composite_score(df_current, factor_weights, use_rank_based)
-            
             port_config = {
-                'top_n': top_n,
-                'method': 'risk_parity' if 'Risk Parity' in weight_method else ('inverse_vol' if 'Inverse' in weight_method else 'equal'),
-                'max_asset_pct': max_asset_cap,
-                'max_sector_pct': max_sector_cap
+                'top_n': top_n, 'method': 'risk_parity' if 'Risk' in weight_method else ('inverse_vol' if 'Inverse' in weight_method else 'equal'),
+                'max_asset_pct': 0.20, 'max_sector_pct': 0.40
             }
             
-            current_weights = construct_portfolio(
-                ranked_current, 
-                current_mom_prices,
-                port_config,
-                sector_series=fundamentals['sector'] if 'sector' in fundamentals else None
-            )
+            current_weights = construct_portfolio(ranked_current, current_mom, port_config, fundamentals['sector'])
             
-            st.write("⏳ Executando Backtest Walk-Forward...")
+            # Backtest
             backtest_config = {
-                'start_date': end_date - timedelta(days=365 * years_backtest),
-                'factor_weights': factor_weights,
-                'use_rank_based': use_rank_based,
-                'min_liquidity': min_liquidity,
-                'portfolio_config': port_config,
-                'transaction_cost_pct': trans_cost
+                'start_date': end_date_dt - timedelta(days=365 * years_backtest),
+                'factor_weights': factor_weights, 'use_rank_based': use_rank_based,
+                'min_liquidity': min_liquidity, 'portfolio_config': port_config, 'transaction_cost_pct': trans_cost
             }
-            
             strategy_rets = run_backtest_engine(prices, fundamentals, backtest_config, volumes)
-            bench_rets = prices['BOVA11.SA'].pct_change().loc[strategy_rets.index]
+            bench_rets = prices['BOVA11.SA'].pct_change().reindex(strategy_rets.index).fillna(0)
             
-            status.update(label="Cálculos Concluídos!", state="complete")
+            status.update(label="Concluído!", state="complete")
 
-        # ======================================================================
-        # PREPARAÇÃO DO PLANO DE EXECUÇÃO
-        # ======================================================================
-        exec_df = pd.DataFrame()
-        total_allocated = 0.0
-        cash_residual = capital_inicial
-        
-        if not current_weights.empty:
-            last_prices = prices.iloc[-1]
-            exec_df = current_weights.to_frame('Peso (%)')
-            exec_df['Financeiro (R$)'] = exec_df['Peso (%)'] * capital_inicial
-            available_prices = last_prices.reindex(exec_df.index)
-            
-            missing_prices = available_prices.isna()
-            if missing_prices.any():
-                st.warning(f"Ativos sem cotação recente: {', '.join(exec_df.index[missing_prices])}")
-            
-            exec_df['Preço Atual (R$)'] = available_prices
-            exec_df['Cotas (Estimadas)'] = (exec_df['Financeiro (R$)'] / exec_df['Preço Atual (R$)'])
-            exec_df['Cotas (Estimadas)'] = exec_df['Cotas (Estimadas)'].fillna(0).astype(int)
-            
-            total_allocated = exec_df['Financeiro (R$)'].sum()
-            cash_residual = capital_inicial - total_allocated
-
-        # ======================================================================
-        # VISUALIZAÇÃO DOS RESULTADOS
-        # ======================================================================
-        
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "🏆 Ranking & Alocação",
-            "📈 Performance & Risco",
-            "🔍 Fatores & Correlação",
-            "📋 Plano de Execução",
-            "💾 Exportar Dados"
-        ])
+        # Visualização
+        tab1, tab2, tab3 = st.tabs(["🏆 Alocação", "📈 Performance", "🎯 Execução"])
         
         with tab1:
-            col1, col2 = st.columns([1.5, 1])
-            with col1:
-                st.subheader("Top Picks (Composite Score)")
-                disp_cols = ['Composite_Score', 'Sector'] + [c for c in ranked_current.columns if '_Norm' in c][:3]
-                st.dataframe(
-                    ranked_current[disp_cols].head(top_n).style.background_gradient(cmap='RdYlGn', subset=['Composite_Score']),
-                    use_container_width=True
-                )
-                
+            c1, c2 = st.columns([1.5, 1])
+            with c1:
+                st.subheader("Ranking de Ativos")
+                st.dataframe(ranked_current[['Composite_Score']].head(top_n).style.background_gradient(cmap='RdYlGn'), use_container_width=True)
+            with c2:
+                st.subheader("Pesos")
                 if not current_weights.empty:
-                    st.subheader("Exposição Setorial")
-                    df_w = current_weights.to_frame('Weight')
-                    df_w['Sector'] = fundamentals.loc[df_w.index, 'sector'].fillna('Unknown')
-                    
-                    # CORREÇÃO DO ERRO DO TREEMAP
-                    df_treemap = df_w.reset_index().rename(columns={'index': 'ticker'})
-                    
-                    fig_tree = px.treemap(
-                        df_treemap,
-                        path=['Sector', 'ticker'],
-                        values='Weight',
-                        title="Alocação por Setor e Ativo"
-                    )
-                    st.plotly_chart(fig_tree, use_container_width=True)
-
-            with col2:
-                st.subheader("Pesos Otimizados")
-                if not current_weights.empty:
-                    w_disp = current_weights.to_frame("Peso")
-                    w_disp["Peso"] = w_disp["Peso"].map("{:.2%}".format)
-                    st.table(w_disp)
-                    
-                    avg_score = ranked_current['Composite_Score'].head(top_n).mean()
-                    if avg_score > 1.2:
-                        st.success("✅ Regime Favorável para os Fatores")
-                    elif avg_score > 0.5:
-                        st.info("ℹ️ Regime Neutro")
-                    else:
-                        st.warning("⚠️ Regime Desfavorável")
+                    fig = px.pie(values=current_weights, names=current_weights.index, hole=0.4)
+                    st.plotly_chart(fig, use_container_width=True)
 
         with tab2:
-            st.subheader(f"Performance Histórica ({years_backtest} Anos)")
             if not strategy_rets.empty:
-                cum_strat = (1 + strategy_rets).cumprod()
-                cum_bench = (1 + bench_rets).cumprod()
-                df_perf = pd.DataFrame({'Estratégia': cum_strat, 'BOVA11': cum_bench})
+                m_s = calculate_metrics(strategy_rets)
+                m_b = calculate_metrics(bench_rets)
                 
-                m_strat = calculate_metrics(strategy_rets)
-                m_bench = calculate_metrics(bench_rets)
+                cols = st.columns(4)
+                cols[0].metric("Retorno Anual", f"{m_s['Annualized Return']:.2%}", f"{m_s['Annualized Return']-m_b['Annualized Return']:.2%}")
+                cols[1].metric("Sharpe", f"{m_s['Sharpe']:.2f}")
+                cols[2].metric("Max DD", f"{m_s['Max Drawdown']:.2%}")
+                cols[3].metric("Volatilidade", f"{m_s['Volatility']:.2%}")
                 
-                c1, c2, c3,
+                res_df = pd.DataFrame({'Estratégia': (1+strategy_rets).cumprod(), 'BOVA11': (1+bench_rets).cumprod()})
+                st.plotly_chart(px.line(res_df, title="Retorno Acumulado (Lump Sum)"), use_container_width=True)
+
+        with tab3:
+            if not current_weights.empty:
+                last_prices = prices.iloc[-1]
+                exec_df = current_weights.to_frame('Peso (%)')
+                exec_df['Financeiro (R$)'] = exec_df['Peso (%)'] * capital_inicial
+                
+                # Tratamento de Preços Faltantes
+                available_prices = last_prices.reindex(exec_df.index)
+                if available_prices.isna().any():
+                    st.warning(f"Atenção: Ativos sem preço recente: {list(available_prices[available_prices.isna()].index)}")
+                
+                exec_df['Preço (R$)'] = available_prices
+                exec_df['Cotas'] = (exec_df['Financeiro (R$)'] / exec_df['Preço (R$)']).fillna(0).astype(int)
+                
+                total_alloc = exec_df['Financeiro (R$)'].sum()
+                st.metric("Total Alocado", f"R$ {total_alloc:,.2f}", delta=f"Cash: R$ {capital_inicial - total_alloc:,.2f}")
+                st.table(exec_df.style.format({'Peso (%)': '{:.2%}', 'Financeiro (R$)': '{:,.2f}', 'Preço (R$)': '{:,.2f}'}))
+                
+                # Gráfico DCA
+                st.divider()
+                st.subheader("Simulação DCA (Acúmulo)")
+                dca_history = calculate_dca_history(strategy_rets, capital_inicial, aporte_mensal)
+                if not dca_history.empty:
+                    # Correção Crítica da Contagem de Meses
+                    monthly_dates = strategy_rets.resample('MS').first().index
+                    months_count = len(monthly_dates)
+                    total_invested = capital_inicial + (aporte_mensal * months_count)
+                    final_value = dca_history['Equity'].iloc[-1]
+                    
+                    mc1, mc2 = st.columns(2)
+                    mc1.metric("Patrimônio Final", f"R$ {final_value:,.2f}")
+                    mc2.metric("Total Investido", f"R$ {total_invested:,.2f}", delta=f"Lucro: R$ {final_value - total_invested:,.2f}")
+                    st.plotly_chart(px.area(dca_history, title="Evolução com Aportes Mensais"), use_container_width=True)
+
+if __name__ == "__main__":
+    main()
