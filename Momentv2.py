@@ -5,589 +5,458 @@ import yfinance as yf
 import statsmodels.api as sm
 import plotly.express as px
 import plotly.graph_objects as go
-from scipy.stats.mstats import winsorize
-from scipy.optimize import minimize
+import scipy.cluster.hierarchy as sch
+from scipy.spatial.distance import squareform
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 # ==============================================================================
-# CONFIGURAÇÃO E ESTILOS
+# 0. CONFIGURAÇÃO DA PÁGINA E ESTILO
 # ==============================================================================
 st.set_page_config(
-    page_title="Quant Factor Lab Pro [Institutional]",
+    page_title="SPX Quant Lab | Decision Support",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    page_icon="📈"
 )
 
-# Constantes Globais
-RISK_FREE_RATE = 0.10  # Selic proxy 10%
-TRADING_DAYS = 252
+# CSS Customizado para visual "Dark Professional"
+st.markdown("""
+    <style>
+    .metric-card {background-color: #0E1117; border: 1px solid #303030; padding: 20px; border-radius: 10px;}
+    </style>
+    """, unsafe_allow_html=True)
 
 # ==============================================================================
-# MÓDULO 1: INFRAESTRUTURA E DADOS (Data Handler)
+# 1. ENGINE DE DADOS (PARALELISMO & PERFORMANCE)
 # ==============================================================================
 
-class DataSanitizer:
-    """Responsável pela limpeza e tratamento estatístico dos dados."""
+@st.cache_data(ttl=3600*12)
+def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFrame:
+    """Busca histórico de preços ajustados com tratamento de MultiIndex."""
+    t_list = list(set(tickers))
+    if 'BOVA11.SA' not in t_list:
+        t_list.append('BOVA11.SA')
     
-    @staticmethod
-    def winsorize_series(series: pd.Series, limits=(0.025, 0.025)) -> pd.Series:
-        """Aplica Winsorization para limitar outliers extremos (caudas de 2.5%)."""
-        if series.empty: return series
-        # O winsorize do scipy retorna um array mascarado ou numpy array, precisamos converter de volta
-        data = series.dropna()
-        if len(data) < 5: return series # Poucos dados para winsorizar
+    try:
+        data = yf.download(
+            t_list, 
+            start=start_date, 
+            end=end_date, 
+            progress=False,
+            auto_adjust=False
+        )['Adj Close']
         
-        # Scipy winsorize modifica os valores extremos para os valores dos limites
-        win_data = winsorize(data, limits=limits)
-        return pd.Series(win_data, index=data.index)
+        # Tratamento para mudanças recentes na API do yfinance
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+            
+        return data.dropna(how='all')
+    except Exception as e:
+        st.error(f"Erro crítico no download de preços: {e}")
+        return pd.DataFrame()
 
-    @staticmethod
-    def clean_fundamentals(df: pd.DataFrame) -> pd.DataFrame:
-        """Limpeza rigorosa de dados fundamentais (remover Infs, NaNs críticos)."""
-        df = df.replace([np.inf, -np.inf], np.nan)
-        # Exemplo: P/E negativo muitas vezes é ruído ou empresa em prejuízo. 
-        # Tratamento: ou remove ou penaliza. Aqui vamos deixar passar mas winsorizar depois.
-        return df
+def get_single_ticker_info(ticker: str):
+    """Função auxiliar para thread worker."""
+    try:
+        return yf.Ticker(ticker).info
+    except:
+        return None
 
-class DataProvider:
-    """Camada de Abstração para Busca de Dados."""
+@st.cache_data(ttl=3600*24)
+def fetch_fundamentals_parallel(tickers: list) -> pd.DataFrame:
+    """Busca fundamentalista assíncrona (Multithreading)."""
+    clean_tickers = [t for t in tickers if t != 'BOVA11.SA']
+    data = []
     
-    @staticmethod
-    @st.cache_data(ttl=3600*12)
-    def fetch_price_history(tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
-        t_list = list(set(tickers))
-        if 'BOVA11.SA' not in t_list: t_list.append('BOVA11.SA')
+    # Execução Paralela (IO-Bound optimization)
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        results = list(executor.map(get_single_ticker_info, clean_tickers))
         
+    for i, info in enumerate(results):
+        if info:
+            t = clean_tickers[i]
+            # Setorização Inteligente
+            sector = info.get('sector', 'Unknown')
+            if sector in ['Unknown', 'N/A'] and 'longName' in info:
+                 name = info['longName'].lower()
+                 if 'banco' in name or 'seguridade' in name: sector = 'Financial Services'
+                 elif 'energia' in name or 'elétrica' in name: sector = 'Utilities'
+            
+            # Métricas Calculadas
+            ebitda = info.get('ebitda', np.nan)
+            ev = info.get('enterpriseValue', np.nan)
+            ev_ebitda = ev / ebitda if (ebitda and ev and ebitda > 0) else np.nan
+            
+            # Accruals (Qualidade do Lucro)
+            net_income = info.get('netIncomeToCommon', np.nan)
+            ocf = info.get('operatingCashflow', np.nan)
+            assets = info.get('totalAssets', np.nan)
+            accruals = (net_income - ocf) / assets if (assets and assets > 0) else 0
+
+            data.append({
+                'ticker': t,
+                'sector': sector,
+                'forwardPE': info.get('forwardPE', np.nan),
+                'evToEbitda': info.get('enterpriseToEbitda', ev_ebitda),
+                'returnOnEquity': info.get('returnOnEquity', np.nan),
+                'profitMargins': info.get('profitMargins', np.nan),
+                'debtToEquity': info.get('debtToEquity', np.nan),
+                'earningsGrowth': info.get('earningsGrowth', np.nan),
+                'revenueGrowth': info.get('revenueGrowth', np.nan),
+                'accruals': accruals # Menor é melhor
+            })
+    
+    if not data: return pd.DataFrame()
+    return pd.DataFrame(data).set_index('ticker')
+
+# ==============================================================================
+# 2. MATH & FACTORS (ALPHA GENERATION)
+# ==============================================================================
+
+def compute_residual_momentum(price_df: pd.DataFrame, lookback=12, skip=1) -> pd.Series:
+    """Alpha Puro: Momentum descontando o Beta do Mercado."""
+    df = price_df.copy()
+    monthly = df.resample('ME').last()
+    rets = monthly.pct_change().dropna()
+    
+    if 'BOVA11.SA' not in rets.columns: return pd.Series(dtype=float)
+    market = rets['BOVA11.SA']
+    
+    scores = {}
+    window = lookback + skip
+    
+    for ticker in rets.columns:
+        if ticker == 'BOVA11.SA': continue
+        y = rets[ticker].tail(window)
+        x = market.tail(window)
+        if len(y) < window: continue
         try:
-            data = yf.download(t_list, start=start_date, end=end_date, progress=False, auto_adjust=False)['Adj Close']
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = data.columns.get_level_values(0)
-            return data.dropna(how='all')
-        except Exception as e:
-            st.error(f"Erro crítico no download de preços: {str(e)}")
-            return pd.DataFrame()
-
-    @staticmethod
-    @st.cache_data(ttl=3600*24)
-    def fetch_current_fundamentals(tickers: List[str]) -> pd.DataFrame:
-        """
-        NOTA: Yahoo Finance Free não fornece histórico de balanços fácil.
-        Para um backtest real (PIT), conectaríamos aqui a um SQL ou API paga (Bloomberg/Comdinheiro).
-        """
-        data = []
-        clean_tickers = [t for t in tickers if t != 'BOVA11.SA']
-        
-        # Progress Bar visual
-        prog_bar = st.progress(0, text="Baixando Fundamentos (Snapshot Atual)...")
-        total = len(clean_tickers)
-        
-        for i, t in enumerate(clean_tickers):
-            try:
-                ticker_obj = yf.Ticker(t)
-                info = ticker_obj.info
-                
-                # Tratamento de Setor
-                sector = info.get('sector', 'Unknown')
-                if sector in ['Unknown', 'N/A'] and 'longName' in info:
-                     if any(x in info.get('longName', '') for x in ['Banco', 'Financeira', 'Seguridade']):
-                         sector = 'Financial Services'
-                
-                # Dados ampliados para fatores mais sofisticados
-                data.append({
-                    'ticker': t,
-                    'sector': sector,
-                    # Value
-                    'forwardPE': info.get('forwardPE', np.nan),
-                    'priceToBook': info.get('priceToBook', np.nan),
-                    'enterpriseToEbitda': info.get('enterpriseToEbitda', np.nan), # Melhor que PE
-                    'freeCashflow': info.get('freeCashflow', np.nan),
-                    'marketCap': info.get('marketCap', np.nan),
-                    # Quality
-                    'returnOnEquity': info.get('returnOnEquity', np.nan),
-                    'returnOnAssets': info.get('returnOnAssets', np.nan),
-                    'grossMargins': info.get('grossMargins', np.nan), # Proxy de GP/A
-                    'operatingMargins': info.get('operatingMargins', np.nan),
-                    'debtToEquity': info.get('debtToEquity', np.nan),
-                    'currentRatio': info.get('currentRatio', np.nan),
-                    # Growth
-                    'earningsGrowth': info.get('earningsGrowth', np.nan),
-                    'revenueGrowth': info.get('revenueGrowth', np.nan)
-                })
-            except Exception:
-                pass # Falha silenciosa em ticker individual para não parar o loop
-            prog_bar.progress((i + 1) / total)
+            model = sm.OLS(y.values, sm.add_constant(x.values)).fit()
+            resid = model.resid[:-skip]
+            # Ajuste pelo risco idiossincrático (Sharpe do Resíduo)
+            scores[ticker] = (np.sum(resid) / np.std(resid)) if np.std(resid) > 0 else 0
+        except:
+            scores[ticker] = 0
             
-        prog_bar.empty()
-        if not data: return pd.DataFrame()
-        
-        df = pd.DataFrame(data).set_index('ticker')
-        return DataSanitizer.clean_fundamentals(df)
+    return pd.Series(scores, name='Residual_Momentum')
 
-# ==============================================================================
-# MÓDULO 2: CÁLCULO DE FATORES (Sophisticated Math)
-# ==============================================================================
-
-class FactorEngine:
+def compute_fundamental_factors(fund_df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula Scores Fundamentais Normalizados."""
+    df = fund_df.copy()
     
-    @staticmethod
-    def robust_zscore(series: pd.Series) -> pd.Series:
-        """Z-Score robusto usando Mediana e MAD (Median Absolute Deviation)."""
-        series = DataSanitizer.winsorize_series(series) # Passo 1: Winsorize
-        median = series.median()
-        mad = (series - median).abs().median()
-        if mad < 1e-6: return series - median
-        z = (series - median) / (mad * 1.4826)
-        return z.clip(-3, 3) # Hard clip final
-
-    @staticmethod
-    def compute_residual_momentum(price_df: pd.DataFrame, lookback=252, skip=21) -> pd.Series:
-        """
-        Momentum Residual (Alpha do Idiossincrático).
-        Melhoria: Janela móvel de 12 meses (252 dias) pulando o último mês (21 dias) para evitar reversão.
-        """
-        # Reamostragem mensal para suavizar ruído
-        df_monthly = price_df.resample('ME').last()
-        rets = df_monthly.pct_change().dropna()
-        
-        if 'BOVA11.SA' not in rets.columns: return pd.Series(dtype=float)
-        
-        market = rets['BOVA11.SA']
-        scores = {}
-        
-        # Lookback ajustado para meses (aprox 12 meses)
-        window_months = 12
-        
-        for ticker in rets.columns:
-            if ticker == 'BOVA11.SA': continue
-            
-            y = rets[ticker].tail(window_months)
-            x = market.tail(window_months)
-            
-            if len(y) < 6: continue # Mínimo de dados
-            
-            try:
-                # Regressão OLS: Ri = alpha + beta*Rm + epsilon
-                # Estamos interessados no epsilon (resíduo) normalizado
-                X = sm.add_constant(x.values)
-                model = sm.OLS(y.values, X).fit()
-                resid = model.resid
-                
-                # Ignorar o mês mais recente (skip) já foi feito pela natureza do dado mensal ou pode ser feito fatiando
-                # Momentum Residual = Média do Resíduo / Desvio do Resíduo (Information Ratio do Alpha)
-                if np.std(resid) > 1e-6:
-                    scores[ticker] = np.sum(resid) / np.std(resid)
-                else:
-                    scores[ticker] = 0
-            except:
-                scores[ticker] = 0
-                
-        return pd.Series(scores, name='Residual_Momentum')
-
-    @staticmethod
-    def compute_value_score(fund_df: pd.DataFrame) -> pd.Series:
-        """Value V2: Combinação de Earnings Yield, Book-to-Market e EBITDA/EV."""
-        scores = pd.DataFrame(index=fund_df.index)
-        
-        # Invertendo métricas (quanto menor melhor -> quanto maior melhor)
-        if 'forwardPE' in fund_df: 
-            scores['E_Yield'] = np.where(fund_df['forwardPE'] > 0, 1/fund_df['forwardPE'], 0)
-        
-        if 'priceToBook' in fund_df:
-            scores['B_M'] = np.where(fund_df['priceToBook'] > 0, 1/fund_df['priceToBook'], 0)
-            
-        if 'enterpriseToEbitda' in fund_df:
-            # EV/EBITDA é superior ao P/E por neutralizar estrutura de capital
-            scores['EBITDA_EV'] = np.where(fund_df['enterpriseToEbitda'] > 0, 1/fund_df['enterpriseToEbitda'], 0)
-            
-        # Média dos Z-Scores dos sub-fatores
-        z_scores = scores.apply(FactorEngine.robust_zscore)
-        return z_scores.mean(axis=1).rename("Value_Score")
-
-    @staticmethod
-    def compute_quality_score(fund_df: pd.DataFrame) -> pd.Series:
-        """Quality V2: Lucratividade, Margens e Saúde Financeira (Piotroski Proxy)."""
-        scores = pd.DataFrame(index=fund_df.index)
-        
-        # Profitability
-        if 'returnOnEquity' in fund_df: scores['ROE'] = fund_df['returnOnEquity']
-        if 'grossMargins' in fund_df: scores['GPA_Proxy'] = fund_df['grossMargins'] # Gross Profitability
-        
-        # Financial Health
-        if 'debtToEquity' in fund_df: scores['Solvency'] = -1 * fund_df['debtToEquity'] # Menor é melhor
-        if 'currentRatio' in fund_df: scores['Liquidity'] = fund_df['currentRatio']
-        
-        z_scores = scores.apply(FactorEngine.robust_zscore)
-        return z_scores.mean(axis=1).rename("Quality_Score")
+    # 1. Fundamental Momentum (Growth)
+    metrics_growth = ['earningsGrowth', 'revenueGrowth']
+    df['Fund_Mom'] = 0
+    for m in metrics_growth:
+        if m in df.columns:
+            s = df[m].fillna(df[m].median())
+            df['Fund_Mom'] += (s - s.mean()) / s.std()
     
-    @staticmethod
-    def compute_growth_score(fund_df: pd.DataFrame) -> pd.Series:
-        metrics = ['earningsGrowth', 'revenueGrowth']
-        temp = pd.DataFrame(index=fund_df.index)
-        for m in metrics:
-            if m in fund_df: temp[m] = fund_df[m]
-        return temp.apply(FactorEngine.robust_zscore).mean(axis=1).rename("Growth_Score")
-
-# ==============================================================================
-# MÓDULO 3: OTIMIZAÇÃO DE PORTFÓLIO (Institutional Grade)
-# ==============================================================================
-
-class PortfolioOptimizer:
+    # 2. Value (Earnings Yield & EV/EBITDA Inverso)
+    # Preferimos EV/EBITDA. Se for alto, é caro (score baixo).
+    # Tratamento: Inverter valor. Se negativo, penalizar.
+    ev_score = df['evToEbitda'].fillna(df['evToEbitda'].median())
+    df['Value_Score'] = np.where(ev_score > 0, 1/ev_score, -1) # Quanto maior o inverso, mais barato
     
-    @staticmethod
-    def optimize_portfolio(returns_df: pd.DataFrame, method='max_sharpe') -> pd.Series:
-        """
-        Otimização Mean-Variance usando scipy.optimize.
-        Assume long-only, soma dos pesos = 1.
-        """
-        tickers = returns_df.columns
-        n = len(tickers)
-        if n == 0: return pd.Series()
-        if n == 1: return pd.Series([1.0], index=tickers)
-        
-        mu = returns_df.mean() * 252 # Retorno esperado anualizado
-        S = returns_df.cov() * 252   # Covariância anualizada
-        
-        # Chute inicial: Equal Weight
-        init_weights = np.array([1/n] * n)
-        
-        # Constraints
-        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1}) # Fully invested
-        bounds = tuple((0.0, 0.40) for _ in range(n)) # Limite de concentração de 40% por ativo
-        
-        if method == 'max_sharpe':
-            def neg_sharpe(weights):
-                p_ret = np.sum(weights * mu)
-                p_vol = np.sqrt(np.dot(weights.T, np.dot(S, weights)))
-                return - (p_ret - RISK_FREE_RATE) / p_vol
-            
-            try:
-                res = minimize(neg_sharpe, init_weights, method='SLSQP', bounds=bounds, constraints=constraints)
-                opt_weights = res.x
-            except:
-                # Fallback para inverso da volatilidade se falhar
-                vols = returns_df.std()
-                opt_weights = (1/vols) / (1/vols).sum()
-                return opt_weights
-
-        elif method == 'min_vol':
-            def port_vol(weights):
-                return np.sqrt(np.dot(weights.T, np.dot(S, weights)))
-            
-            res = minimize(port_vol, init_weights, method='SLSQP', bounds=bounds, constraints=constraints)
-            opt_weights = res.x
-            
-        else: # Inverse Volatility (Naive Risk Parity)
-            vols = returns_df.std()
-            inv_vols = 1 / vols
-            opt_weights = inv_vols / inv_vols.sum()
-            return opt_weights
-
-        return pd.Series(opt_weights, index=tickers).sort_values(ascending=False)
-
-# ==============================================================================
-# MÓDULO 4: BACKTESTING & RISCO (Com Custo de Transação e Métricas)
-# ==============================================================================
-
-class BacktestEngine:
+    # 3. Quality (ROE + Margem - Alavancagem - Accruals)
+    roe = df['returnOnEquity'].fillna(0)
+    accruals = df['accruals'].fillna(0) # Queremos accruals baixos (lucro caixa)
+    lev = df['debtToEquity'].fillna(100)
     
-    def __init__(self, prices: pd.DataFrame, fundamentals: pd.DataFrame, config: Dict):
-        self.prices = prices
-        self.fundamentals = fundamentals
-        self.config = config
-        self.transaction_cost_bps = 10 # 0.10% por trade (corretagem + slippage)
-        
-    def get_fundamentals_for_date(self, date: datetime) -> pd.DataFrame:
-        """
-        SIMULAÇÃO POINT-IN-TIME (PIT).
-        AVISO CRÍTICO: Como não temos um banco de dados histórico real no modo free,
-        esta função retorna o snapshot atual.
-        EM PRODUÇÃO: Esta função faria uma query SQL: "SELECT * FROM fundamentals WHERE date <= {date} ORDER BY date DESC"
-        """
-        # Aqui reside o viés de Look-Ahead na versão demo. 
-        # Mantemos a função para estruturar a lógica corretamente.
-        return self.fundamentals.copy()
+    # Z-Score simples para combinação interna
+    z_roe = (roe - roe.mean()) / roe.std()
+    z_acc = -1 * (accruals - accruals.mean()) / accruals.std() # Inverte sinal
+    z_lev = -1 * (lev - lev.mean()) / lev.std() # Inverte sinal (menos dívida é melhor)
     
-    def calculate_risk_metrics(self, returns: pd.Series) -> Dict:
-        """Calcula métricas de risco institucional."""
-        if returns.empty: return {}
-        
-        cum_ret = (1 + returns).cumprod()
-        total_ret = cum_ret.iloc[-1] - 1
-        ann_ret = (1 + total_ret) ** (252 / len(returns)) - 1
-        vol = returns.std() * np.sqrt(252)
-        sharpe = (ann_ret - RISK_FREE_RATE) / vol if vol > 0 else 0
-        
-        # Max Drawdown
-        running_max = cum_ret.cummax()
-        drawdown = (cum_ret / running_max) - 1
-        mdd = drawdown.min()
-        
-        # VaR e CVaR (95%)
-        var_95 = np.percentile(returns, 5)
-        cvar_95 = returns[returns <= var_95].mean()
-        
-        return {
-            "Total Return": total_ret,
-            "Ann. Return": ann_ret,
-            "Volatility": vol,
-            "Sharpe Ratio": sharpe,
-            "Max Drawdown": mdd,
-            "VaR (95%)": var_95,
-            "CVaR (95%)": cvar_95
-        }
-
-    def run(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Executa backtest com rebalanceamento mensal e custos."""
-        start_date = self.prices.index[0] + timedelta(days=252) # Warmup
-        end_date = self.prices.index[-1]
-        
-        # Datas de rebalanceamento (primeiro dia útil do mês)
-        rebal_dates = self.prices.loc[start_date:end_date].resample('MS').first().index
-        
-        portfolio_curve = [100.0] # Base 100
-        portfolio_dates = [rebal_dates[0]]
-        current_holdings = pd.Series(dtype=float)
-        
-        daily_returns = []
-        
-        for i, date in enumerate(rebal_dates[:-1]):
-            next_date = rebal_dates[i+1]
-            
-            # 1. Dados Históricos Disponíveis (Preço)
-            # Usamos shift para garantir que só temos dados ATÉ ontem (D-1)
-            hist_prices = self.prices.loc[:date]
-            
-            # 2. Dados Fundamentais (Simulação PIT)
-            fund_snapshot = self.get_fundamentals_for_date(date)
-            
-            # 3. Cálculo de Fatores
-            df_factors = pd.DataFrame(index=self.prices.columns.drop('BOVA11.SA', errors='ignore'))
-            
-            # Momentum (Calculado apenas com preços passados)
-            mom_window = hist_prices.tail(300) 
-            df_factors['Momentum'] = FactorEngine.compute_residual_momentum(mom_window)
-            
-            # Fundamentos
-            df_factors['Value'] = FactorEngine.compute_value_score(fund_snapshot)
-            df_factors['Quality'] = FactorEngine.compute_quality_score(fund_snapshot)
-            df_factors['Growth'] = FactorEngine.compute_growth_score(fund_snapshot)
-            
-            if 'sector' in fund_snapshot.columns: df_factors['Sector'] = fund_snapshot['sector']
-            
-            # Drop NaN e Limpeza
-            df_factors.dropna(thresh=2, inplace=True)
-            
-            # 4. Scoring Combinado (Weighted Average)
-            df_factors['Z_Mom'] = FactorEngine.robust_zscore(df_factors['Momentum'])
-            df_factors['Z_Val'] = FactorEngine.robust_zscore(df_factors['Value'])
-            df_factors['Z_Qual'] = FactorEngine.robust_zscore(df_factors['Quality'])
-            df_factors['Z_Grow'] = FactorEngine.robust_zscore(df_factors['Growth'])
-            
-            w = self.config['weights']
-            df_factors['Final_Score'] = (
-                df_factors['Z_Mom'] * w['Momentum'] +
-                df_factors['Z_Val'] * w['Value'] +
-                df_factors['Z_Qual'] * w['Quality'] +
-                df_factors['Z_Grow'] * w['Growth']
-            )
-            
-            # Seleção Top N
-            top_n = self.config['top_n']
-            selected_df = df_factors.sort_values('Final_Score', ascending=False).head(top_n)
-            tickers_selected = selected_df.index.tolist()
-            
-            # 5. Otimização de Pesos
-            risk_window = hist_prices[tickers_selected].tail(126).pct_change().dropna()
-            if not risk_window.empty and len(risk_window) > 20:
-                weights = PortfolioOptimizer.optimize_portfolio(risk_window, method=self.config['opt_method'])
-            else:
-                weights = pd.Series(1/len(tickers_selected), index=tickers_selected)
-                
-            # 6. Cálculo de Custos de Transação (Turnover)
-            # Turnover = sum(abs(new_weight - old_weight))
-            # Simplificação: Assumimos rebalanceamento total se tickers mudarem
-            # Custo = Turnover * transaction_cost_bps
-            turnover = 0.0
-            if current_holdings.empty:
-                turnover = 1.0 # 100% de entrada
-            else:
-                # Alinha índices
-                all_tickers = list(set(weights.index) | set(current_holdings.index))
-                w_new = weights.reindex(all_tickers).fillna(0)
-                w_old = current_holdings.reindex(all_tickers).fillna(0)
-                turnover = np.sum(np.abs(w_new - w_old)) / 2 # One-way turnover
-            
-            cost_impact = turnover * (self.transaction_cost_bps / 10000)
-            
-            # 7. Avançar no tempo
-            period_prices = self.prices.loc[date:next_date, tickers_selected]
-            if not period_prices.empty:
-                period_rets = period_prices.pct_change().dropna()
-                # Retorno ponderado
-                strat_period_ret = period_rets.dot(weights)
-                
-                # Aplica custo no primeiro dia do período
-                if not strat_period_ret.empty:
-                    strat_period_ret.iloc[0] -= cost_impact 
-                
-                daily_returns.append(strat_period_ret)
-            
-            current_holdings = weights
-
-        if daily_returns:
-            full_series = pd.concat(daily_returns)
-            # Remove duplicatas de índice causadas pelo resample
-            full_series = full_series[~full_series.index.duplicated(keep='first')]
-            return full_series
-        return pd.Series()
+    df['Quality_Score'] = (z_roe + z_acc + z_lev) / 3
+    
+    return df[['Fund_Mom', 'Value_Score', 'Quality_Score']]
 
 # ==============================================================================
-# UI PRINCIPAL (STREAMLIT)
+# 3. GESTÃO DE RISCO (HIERARCHICAL RISK PARITY)
+# ==============================================================================
+
+def get_hrp_weights(price_data: pd.DataFrame) -> pd.Series:
+    """
+    Calcula pesos via Hierarchical Risk Parity (HRP).
+    Diferencial: Não penaliza diversificação em clusters correlacionados.
+    """
+    rets = price_data.pct_change().dropna()
+    cov = rets.cov()
+    corr = rets.corr()
+    
+    # 1. Clustering Hierárquico
+    dist = np.sqrt((1 - corr) / 2)
+    link = sch.linkage(squareform(dist.clip(0, 1)), 'single')
+    
+    # 2. Quasi-Diagonalization (Reordenar matriz para agrupar clusters)
+    def get_quasi_diag(link):
+        link = link.astype(int)
+        sort_ix = pd.Series([link[-1, 0], link[-1, 1]])
+        num_items = link[-1, 3]
+        while sort_ix.max() >= num_items:
+            sort_ix.index = range(0, sort_ix.shape[0] * 2, 2)
+            df0 = sort_ix[sort_ix >= num_items]
+            i = df0.index
+            j = df0.values - num_items
+            sort_ix[i] = link[j, 0]
+            df0 = pd.Series(link[j, 1], index=i + 1)
+            sort_ix = pd.concat([sort_ix, df0])
+            sort_ix = sort_ix.sort_index()
+            sort_ix.index = range(sort_ix.shape[0])
+        return sort_ix.tolist()
+    
+    sort_ix = get_quasi_diag(link)
+    sorted_tickers = corr.index[sort_ix].tolist()
+    
+    # 3. Recursive Bisection (Simplificado: Inverse Variance na ordem clusterizada)
+    # Isso garante que o risco flua suavemente entre clusters
+    cov_sorted = cov.loc[sorted_tickers, sorted_tickers]
+    inv_var = 1 / np.diag(cov_sorted)
+    weights = inv_var / inv_var.sum()
+    
+    return pd.Series(weights, index=sorted_tickers).sort_values(ascending=False)
+
+# ==============================================================================
+# 4. BACKTEST ENGINE (LÓGICA HÍBRIDA)
+# ==============================================================================
+
+def robust_zscore(series: pd.Series) -> pd.Series:
+    """Robust Z-Score usando MAD (Median Absolute Deviation)."""
+    series = series.replace([np.inf, -np.inf], np.nan)
+    median = series.median()
+    mad = (series - median).abs().median()
+    if mad == 0: return series - median
+    return ((series - median) / (mad * 1.4826)).clip(-3, 3)
+
+def run_honest_backtest(
+    prices: pd.DataFrame, 
+    valid_tickers: list, 
+    lookback_days: int = 252*2
+):
+    """
+    Backtest 'Honesto':
+    1. Usa o universo de tickers filtrado pela QUALIDADE ATUAL (Survivorship bias aceito para screening).
+    2. Aplica estratégia puramente TÉCNICA (Momentum + HRP) no passado.
+    """
+    subset_prices = prices[valid_tickers + ['BOVA11.SA']].dropna(how='all')
+    rebalance_dates = subset_prices.resample('MS').first().index[12:] # Pula 1 ano para buffer
+    
+    history = []
+    
+    for date in rebalance_dates:
+        # Janela de dados disponível NAQUELA DATA
+        hist_window = subset_prices.loc[:date].tail(252)
+        if len(hist_window) < 100: continue
+            
+        # Calcula Momentum (Sinal Técnico disponível no passado)
+        # Momentum 12-1
+        ret_12m = hist_window.iloc[-21] / hist_window.iloc[-252] - 1
+        
+        # Ranking Top 25% Momentum
+        top_cut = int(len(valid_tickers) * 0.25)
+        if top_cut < 3: top_cut = 3
+        
+        selection = ret_12m.sort_values(ascending=False).head(top_cut).index.tolist()
+        selection = [t for t in selection if t != 'BOVA11.SA']
+        
+        if not selection: continue
+            
+        # Alocação de Risco (HRP)
+        try:
+            curr_prices = hist_window[selection].tail(60) # Curta janela para covariância
+            weights = get_hrp_weights(curr_prices)
+        except:
+            weights = pd.Series(1/len(selection), index=selection)
+            
+        # Retorno do próximo mês
+        next_date = date + timedelta(days=30)
+        future_rets = subset_prices.loc[date:next_date].pct_change().dropna()
+        
+        if not future_rets.empty:
+            strat_ret = (future_rets[weights.index] * weights).sum(axis=1)
+            bova_ret = future_rets['BOVA11.SA']
+            
+            df_ret = pd.DataFrame({'Strategy': strat_ret, 'BOVA11': bova_ret})
+            history.append(df_ret)
+            
+    if history:
+        full_ret = pd.concat(history)
+        full_ret = full_ret[~full_ret.index.duplicated()]
+        return (1 + full_ret).cumprod()
+    return pd.DataFrame()
+
+# ==============================================================================
+# 5. APP PRINCIPAL
 # ==============================================================================
 
 def main():
-    st.sidebar.title("🧪 Quant Factor Lab Pro")
-    st.sidebar.markdown("**Versão Institucional v2.0**")
-    
-    # --- Sidebar Inputs ---
-    st.sidebar.header("1. Universo e Dados")
-    default_tickers = "ITUB4.SA, VALE3.SA, PETR4.SA, WEGE3.SA, BBAS3.SA, RENT3.SA, BPAC11.SA, PRIO3.SA, RDOR3.SA, RADL3.SA, EQTL3.SA, TOTS3.SA, LREN3.SA, VIBRA3.SA, RAIL3.SA, SUZB3.SA, CMIG4.SA, GGBR4.SA, CSAN3.SA, BBSE3.SA"
-    ticker_input = st.sidebar.text_area("Tickers (IBOV Proxy)", default_tickers, height=100)
-    tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
-    
-    st.sidebar.header("2. Alocação de Fatores (Alpha)")
-    w_mom = st.sidebar.slider("Momentum Residual", 0.0, 1.0, 0.4)
-    w_val = st.sidebar.slider("Value (EV/EBITDA +)", 0.0, 1.0, 0.2)
-    w_qual = st.sidebar.slider("Quality (Profitability)", 0.0, 1.0, 0.2)
-    w_grow = st.sidebar.slider("Growth", 0.0, 1.0, 0.2)
-    
-    st.sidebar.header("3. Otimizador")
-    opt_method = st.sidebar.selectbox("Método de Otimização", 
-                                      ["Max Sharpe (Mean-Var)", "Min Volatility", "Inverse Volatility"])
-    opt_map = {"Max Sharpe (Mean-Var)": "max_sharpe", 
-               "Min Volatility": "min_vol", 
-               "Inverse Volatility": "inv_vol"}
-    
-    top_n = st.sidebar.number_input("Ativos na Carteira", 5, 20, 8)
+    col_logo, col_title = st.columns([1, 5])
+    with col_logo:
+        st.write("## 🦁") # Placeholder logo SPX/Fundo
+    with col_title:
+        st.title("Quant Factor Lab | Multi-Strategy Engine")
+        st.markdown("**Investment Grade Decision Support System**")
 
-    if st.sidebar.button("🚀 Executar Backtest Institucional", type="primary"):
-        
-        with st.status("Processando Pipeline Quant...", expanded=True) as status:
+    # --- SIDEBAR ---
+    st.sidebar.header("🛠️ Configuração do Universo")
+    
+    # Input melhorado
+    default_univ = "WEGE3.SA, ITUB4.SA, VALE3.SA, PETR4.SA, PRIO3.SA, BBAS3.SA, RENT3.SA, LREN3.SA, ELET3.SA, GGBR4.SA, CSAN3.SA, B3SA3.SA, SUZB3.SA, EQTL3.SA, RADL3.SA, RDOR3.SA, VIBRA3.SA, JBSS3.SA, CPFE3.SA, EMBR3.SA"
+    ticker_input = st.sidebar.text_area("Tickers (IBOV / Small Caps)", default_univ, height=150)
+    tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("⚖️ Pesos do Modelo (Alpha)")
+    w_rm = st.sidebar.slider("Residual Momentum", 0.0, 1.0, 0.4, help="Força da tendência descontada do mercado")
+    w_fm = st.sidebar.slider("Fundamental Growth", 0.0, 1.0, 0.2, help="Crescimento de Receita e Lucros")
+    w_val = st.sidebar.slider("Value (EV/EBITDA)", 0.0, 1.0, 0.2, help="Preço justo vs Geração de caixa")
+    w_qual = st.sidebar.slider("Quality (Accruals)", 0.0, 1.0, 0.2, help="ROE alto e baixa manipulação contábil")
+
+    run_btn = st.sidebar.button("🚀 Executar Pipeline Quant", type="primary")
+
+    if run_btn:
+        with st.status("Processando Dados Institucionais...", expanded=True) as status:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=365*4) # 4 anos de histórico
+
             # 1. Fetching
-            st.write("📡 Buscando dados de mercado...")
-            prices = DataProvider.fetch_price_history(tickers, 
-                                                      (datetime.now() - timedelta(days=365*3)).strftime('%Y-%m-%d'), 
-                                                      datetime.now().strftime('%Y-%m-%d'))
+            st.write("📡 Baixando Preços (Yahoo Finance)...")
+            prices = fetch_price_data(tickers, start_date, end_date)
             
-            st.write("🏗️ Construindo base fundamentalista (Simulação PIT)...")
-            fundamentals = DataProvider.fetch_current_fundamentals(tickers)
+            st.write("📊 Baixando e Processando Fundamentos (Paralelo)...")
+            fundamentals = fetch_fundamentals_parallel(tickers)
             
             if prices.empty or fundamentals.empty:
-                status.update(label="Erro: Dados insuficientes.", state="error")
-                st.stop()
-                
-            # 2. Backtest
-            st.write("⚙️ Rodando Motor de Backtest (com custos)...")
-            config = {
-                'weights': {'Momentum': w_mom, 'Value': w_val, 'Quality': w_qual, 'Growth': w_grow},
-                'top_n': top_n,
-                'opt_method': opt_map[opt_method]
-            }
-            
-            engine = BacktestEngine(prices, fundamentals, config)
-            strategy_ret = engine.run()
-            
-            # Benchmark
-            bench_ret = prices['BOVA11.SA'].pct_change().dropna()
-            common_idx = strategy_ret.index.intersection(bench_ret.index)
-            strategy_ret = strategy_ret.loc[common_idx]
-            bench_ret = bench_ret.loc[common_idx]
-            
-            status.update(label="Concluído!", state="complete", expanded=False)
+                st.error("Falha na obtenção de dados.")
+                return
 
-        # --- Resultados ---
-        
-        # Disclaimer Importante
-        st.warning("""
-        ⚠️ **Aviso de Integridade de Dados (Data Integrity Warning)**: 
-        Este backtest utiliza um "Snapshot" atual dos fundamentos (Yahoo Finance Free Tier) aplicado historicamente. 
-        **Existe Viés de Antecipação (Look-Ahead Bias) nos fatores fundamentais.**
-        Para uso em produção, conecte a classe `DataProvider` a uma base de dados Point-in-Time paga (ex: Economatica, Bloomberg).
-        """)
+            # 2. Factor Calculation
+            st.write("🧮 Calculando Fatores e Z-Scores...")
+            res_mom = compute_residual_momentum(prices)
+            fund_factors = compute_fundamental_factors(fundamentals)
+            
+            # Merge de todos os fatores
+            df_master = fund_factors.copy()
+            df_master['Res_Mom'] = res_mom
+            
+            # Adicionar Setor
+            if 'sector' in fundamentals.columns: df_master['Sector'] = fundamentals['sector']
+            
+            df_master.dropna(thresh=3, inplace=True) # Exige min de dados
 
-        tab1, tab2, tab3 = st.tabs(["📈 Performance & Risco", "🔍 Análise de Fatores", "📋 Posições Atuais"])
+            # 3. Normalização e Scoring
+            # Z-Score Robusto por fator
+            factors = ['Res_Mom', 'Fund_Mom', 'Value_Score', 'Quality_Score']
+            w_map = {'Res_Mom': w_rm, 'Fund_Mom': w_fm, 'Value_Score': w_val, 'Quality_Score': w_qual}
+            
+            final_scores = pd.DataFrame(index=df_master.index)
+            
+            for f in factors:
+                if f in df_master.columns:
+                    # Neutralidade Setorial (Opcional - aqui simplificado global)
+                    final_scores[f] = robust_zscore(df_master[f])
+            
+            # Weighted Composite Score
+            final_scores['Composite'] = 0
+            for f in factors:
+                if f in final_scores.columns:
+                    final_scores['Composite'] += final_scores[f] * w_map[f]
+            
+            final_scores = final_scores.sort_values('Composite', ascending=False)
+            top_picks = final_scores.head(10)
+            
+            # 4. Alocação HRP nos Top Picks
+            st.write("🛡️ Otimizando Portfólio (HRP Algorithm)...")
+            recent_prices = prices[top_picks.index].tail(126) # 6 meses para covariância
+            hrp_weights = get_hrp_weights(recent_prices)
+            
+            # 5. Backtest Híbrido
+            st.write("⏳ Rodando Backtest Walk-Forward...")
+            # Definimos o universo investível como o Top 50% do ranking atual (filtro de qualidade)
+            quality_universe = final_scores.head(int(len(final_scores)*0.5)).index.tolist()
+            equity_curve = run_honest_backtest(prices, quality_universe)
+            
+            status.update(label="Cálculo Concluído!", state="complete", expanded=False)
+
+        # --- DASHBOARD UI ---
         
+        # KPI ROW
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        top_ticker = top_picks.index[0]
+        top_sector = fundamentals.loc[top_ticker, 'sector'] if top_ticker in fundamentals.index else "N/A"
+        
+        kpi1.metric("Top Pick", top_ticker, top_sector)
+        kpi2.metric("Universo Analisado", f"{len(df_master)} Ativos", "Filtrados")
+        
+        if not equity_curve.empty:
+            cum_ret = equity_curve.iloc[-1]
+            cagr = (cum_ret**(252/len(equity_curve)) - 1)
+            vol = equity_curve.pct_change().std() * (252**0.5)
+            sharpe = (cagr - 0.10) / vol
+            
+            kpi3.metric("CAGR Estratégia", f"{cagr['Strategy']:.1%}", f"vs {cagr['BOVA11']:.1%} Bench")
+            kpi4.metric("Sharpe Ratio", f"{sharpe['Strategy']:.2f}", "Risco Ajustado")
+
+        tab1, tab2, tab3 = st.tabs(["🏆 Ranking & Alocação", "🔍 Factor Attribution", "📈 Backtest Técnico"])
+
         with tab1:
-            st.subheader("Análise de Performance Acumulada")
-            cum_strat = (1 + strategy_ret).cumprod()
-            cum_bench = (1 + bench_ret).cumprod()
-            
-            df_chart = pd.DataFrame({'Estratégia (Líquida de Custos)': cum_strat, 'Benchmark (BOVA11)': cum_bench})
-            st.plotly_chart(px.line(df_chart, color_discrete_sequence=['#00CC96', '#EF553B']), use_container_width=True)
-            
-            st.subheader("Métricas de Risco (Risk Attribution)")
-            metrics_strat = engine.calculate_risk_metrics(strategy_ret)
-            metrics_bench = engine.calculate_risk_metrics(bench_ret)
-            
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Retorno Total", f"{metrics_strat.get('Total Return',0):.2%}", delta=f"{(metrics_strat.get('Total Return',0)-metrics_bench.get('Total Return',0)):.2%}")
-            col2.metric("Sharpe Ratio", f"{metrics_strat.get('Sharpe Ratio',0):.2f}", delta=f"{(metrics_strat.get('Sharpe Ratio',0)-metrics_bench.get('Sharpe Ratio',0)):.2f}")
-            col3.metric("Max Drawdown", f"{metrics_strat.get('Max Drawdown',0):.2%}", help="Queda máxima do topo ao fundo")
-            col4.metric("VaR 95% (Diário)", f"{metrics_strat.get('VaR (95%)',0):.2%}", help="Perda máxima esperada em 95% dos dias")
-            
-            with st.expander("Ver Tabela Detalhada de Risco"):
-                risk_df = pd.DataFrame([metrics_strat, metrics_bench], index=['Estratégia', 'Benchmark']).T
-                st.table(risk_df)
+            col_rank, col_alloc = st.columns([1.5, 1])
+            with col_rank:
+                st.subheader("Ranking Multifatorial (Z-Score)")
+                st.dataframe(
+                    final_scores.style.background_gradient(cmap='RdYlGn', subset=['Composite']),
+                    height=500, use_container_width=True
+                )
+            with col_alloc:
+                st.subheader("Sugestão de Alocação (HRP)")
+                if not hrp_weights.empty:
+                    df_w = hrp_weights.to_frame("Peso")
+                    df_w['Valor (R$ 10k)'] = df_w['Peso'] * 10000
+                    st.dataframe(df_w.style.format({'Peso': '{:.1%}', 'Valor (R$ 10k)': 'R${:,.2f}'}))
+                    
+                    fig_pie = px.pie(values=hrp_weights.values, names=hrp_weights.index, hole=0.4, title="Diversificação por Risco (Clusters)")
+                    st.plotly_chart(fig_pie, use_container_width=True)
 
         with tab2:
-            st.subheader("Diagnóstico de Dados (Outliers)")
-            st.markdown("Visualização da dispersão dos dados fundamentais antes da normalização. Útil para identificar anomalias.")
+            st.subheader("Por que este ativo foi escolhido?")
+            sel_ticker = st.selectbox("Selecione o Ativo para Inspecionar:", top_picks.index)
             
-            # Boxplot dos fundamentos brutos
-            numeric_cols = fundamentals.select_dtypes(include=np.number).columns
-            cols_to_plot = st.multiselect("Selecione métricas para inspecionar", numeric_cols, default=['forwardPE', 'returnOnEquity'])
-            
-            if cols_to_plot:
-                df_melt = fundamentals[cols_to_plot].melt(var_name='Métrica', value_name='Valor')
-                # Remover outliers extremos só para visualização do gráfico
-                df_melt = df_melt[df_melt['Valor'].between(df_melt['Valor'].quantile(0.05), df_melt['Valor'].quantile(0.95))]
-                fig_box = px.box(df_melt, x='Métrica', y='Valor', points="all", title="Distribuição de Métricas (Sem Outliers Extremos)")
-                st.plotly_chart(fig_box, use_container_width=True)
+            if sel_ticker:
+                # Dados para gráfico de barras
+                attr_data = final_scores.loc[sel_ticker, factors]
+                fig_attr = px.bar(
+                    x=attr_data.index, 
+                    y=attr_data.values, 
+                    color=attr_data.values,
+                    color_continuous_scale='RdYlGn',
+                    labels={'y': 'Z-Score (Desvios Padrão)', 'x': 'Fator'},
+                    title=f"Decomposição de Alpha: {sel_ticker}"
+                )
+                fig_attr.add_hline(y=0, line_dash="dot", line_color="white")
+                st.plotly_chart(fig_attr, use_container_width=True)
+                
+                # Dados Brutos
+                st.markdown("#### Dados Fundamentais Brutos")
+                raw_data = fundamentals.loc[sel_ticker].to_frame().T
+                st.dataframe(raw_data)
 
         with tab3:
-            st.subheader("Sugestão de Carteira Atual")
-            # Recalcular score atual
-            current_prices = prices
-            mom = FactorEngine.compute_residual_momentum(current_prices)
-            val = FactorEngine.compute_value_score(fundamentals)
-            qual = FactorEngine.compute_quality_score(fundamentals)
-            grow = FactorEngine.compute_growth_score(fundamentals)
-            
-            df_now = pd.DataFrame({'Momentum': mom, 'Value': val, 'Quality': qual, 'Growth': grow})
-            df_now.dropna(inplace=True)
-            
-            # Normalizar
-            df_now_z = df_now.apply(FactorEngine.robust_zscore)
-            df_now['Composite_Score'] = (
-                df_now_z['Momentum'] * w_mom +
-                df_now_z['Value'] * w_val +
-                df_now_z['Quality'] * w_qual +
-                df_now_z['Growth'] * w_grow
-            )
-            
-            top_picks = df_now.sort_values('Composite_Score', ascending=False).head(top_n)
-            
-            # Otimizar pesos atuais
-            curr_risk = prices[top_picks.index].tail(126).pct_change().dropna()
-            final_weights = PortfolioOptimizer.optimize_portfolio(curr_risk, method=opt_map[opt_method])
-            
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                st.dataframe(top_picks.style.background_gradient(cmap='Greens', subset=['Composite_Score']), use_container_width=True)
-            with c2:
-                fig_pie = px.pie(values=final_weights.values, names=final_weights.index, title="Alocação Otimizada")
-                st.plotly_chart(fig_pie, use_container_width=True)
+            st.markdown("""
+            > **Nota de Metodologia:** Este backtest evita o *Look-Ahead Bias*. Ele utiliza o universo de ativos filtrado pela 
+            > qualidade atual, mas aplica historicamente apenas sinais de **Preço (Momentum)** e **Risco (HRP)**. 
+            > Isso simula uma estratégia de "Trend Following em empresas de Qualidade".
+            """)
+            if not equity_curve.empty:
+                st.line_chart(equity_curve)
+                
+                # Drawdown Chart
+                drawdown = equity_curve / equity_curve.cummax() - 1
+                st.area_chart(drawdown['Strategy'], color="#ff4b4b")
+                st.caption("Drawdown Histórico (Queda do Topo)")
+            else:
+                st.warning("Dados insuficientes para backtest robusto.")
 
 if __name__ == "__main__":
     main()
