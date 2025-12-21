@@ -194,7 +194,7 @@ def compute_size_score(fund_df: pd.DataFrame) -> pd.Series:
     if 'marketCap' not in fund_df.columns: return pd.Series(dtype=float)
     mcap = fund_df['marketCap'].replace(0, np.nan)
     log_mcap = np.log(mcap)
-    return (-1 * (log_mcap - log_mcap.mean()) / log_mcap.std()).rename("Size_Score")  # Normalizado
+    return (-1 * (log_mcap - log_mcap.mean()) / log_mcap.std()).rename("Size_Score")
 
 # ==============================================================================
 # MÓDULO 3: SCORING & NORMALIZAÇÃO (Advanced)
@@ -523,7 +523,7 @@ def main():
 
         with st.status("Processando Pipeline Quantitativo...", expanded=True) as status:
             end_date = datetime.now()
-            start_date = end_date - timedelta(days=365 * (years_backtest + 2))  # +2 anos para momentum
+            start_date = end_date - timedelta(days=365 * (years_backtest + 2))
             
             st.write("📥 Baixando Preços e Volume...")
             prices, volumes = fetch_market_data(tickers, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
@@ -641,8 +641,16 @@ def main():
                     st.subheader("Exposição Setorial")
                     df_w = current_weights.to_frame('Weight')
                     df_w['Sector'] = fundamentals.loc[df_w.index, 'sector'].fillna('Unknown')
-                    fig_tree = px.treemap(df_w.reset_index(), path=['Sector', 'ticker'], values='Weight',
-                                          title="Alocação por Setor e Ativo")
+                    
+                    # CORREÇÃO DO ERRO DO TREEMAP
+                    df_treemap = df_w.reset_index().rename(columns={'index': 'ticker'})
+                    
+                    fig_tree = px.treemap(
+                        df_treemap,
+                        path=['Sector', 'ticker'],
+                        values='Weight',
+                        title="Alocação por Setor e Ativo"
+                    )
                     st.plotly_chart(fig_tree, use_container_width=True)
 
             with col2:
@@ -670,104 +678,4 @@ def main():
                 m_strat = calculate_metrics(strategy_rets)
                 m_bench = calculate_metrics(bench_rets)
                 
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Retorno Total", f"{m_strat['Total Return']:.2%}", 
-                          delta=f"{m_strat['Total Return'] - m_bench['Total Return']:.2%}")
-                c2.metric("Sharpe Ratio", f"{m_strat['Sharpe']:.2f}", 
-                          delta=f"{m_strat['Sharpe'] - m_bench['Sharpe']:.2f}")
-                c3.metric("Volatilidade Anual", f"{m_strat['Volatility']:.2%}")
-                c4.metric("Max Drawdown", f"{m_strat['Max Drawdown']:.2%}")
-                
-                st.plotly_chart(px.line(df_perf, title="Evolução do Patrimônio (Base 1.0)",
-                                        color_discrete_map={'Estratégia': '#00CC96', 'BOVA11': '#EF553B'}),
-                                use_container_width=True)
-                
-                with st.expander("Métricas Detalhadas"):
-                    metrics_df = pd.DataFrame([m_strat, m_bench], index=['Estratégia', 'Benchmark']).T
-                    st.dataframe(metrics_df.style.format("{:.2%}"), use_container_width=True)
-
-        with tab3:
-            st.subheader("Correlação entre Fatores Normalizados")
-            if not ranked_current.empty:
-                factor_cols = [c for c in ranked_current.columns if '_Norm' in c]
-                if factor_cols:
-                    corr = ranked_current[factor_cols].corr()
-                    fig = px.imshow(corr, text_auto=True, color_continuous_scale='RdBu_r',
-                                    title="Matriz de Correlação dos Fatores")
-                    st.plotly_chart(fig, use_container_width=True)
-            
-            st.subheader("Dados Fundamentais (Snapshot)")
-            st.dataframe(fundamentals.style.format("{:.2f}"), use_container_width=True)
-
-        with tab4:
-            st.subheader("🎯 Plano de Execução Atual")
-            st.markdown(f"**Capital Disponível: R$ {capital_inicial:,.2f}**")
-            
-            col_a1, col_a2, col_a3 = st.columns(3)
-            col_a1.metric("Alocado em Ativos", f"R$ {total_allocated:,.2f}")
-            col_a2.metric("Cash Residual", f"R$ {cash_residual:,.2f}")
-            col_a3.metric("Taxa de Alocação", f"{(total_allocated/capital_inicial):.2%}")
-            
-            if not exec_df.empty:
-                st.dataframe(
-                    exec_df.style.format({
-                        'Peso (%)': '{:.2%}',
-                        'Financeiro (R$)': 'R$ {:,.2f}',
-                        'Preço Atual (R$)': 'R$ {:,.2f}'
-                    }),
-                    use_container_width=True
-                )
-            else:
-                st.info("Nenhum ativo selecionado para o portfólio atual.")
-            
-            st.divider()
-            st.subheader("⏳ Simulação de Acúmulo com Aportes (DCA)")
-            
-            if not strategy_rets.empty:
-                dca_df = calculate_dca_history(strategy_rets, capital_inicial, aporte_mensal)
-                monthly_dates = strategy_rets.index.to_series().dt.is_month_start
-                months_count = monthly_dates.sum()
-                total_invested = capital_inicial + (aporte_mensal * months_count)
-                final_equity = dca_df['Equity'].iloc[-1]
-                
-                col_d1, col_d2 = st.columns(2)
-                col_d1.metric("Patrimônio Final Estimado", f"R$ {final_equity:,.2f}")
-                col_d2.metric("Total Investido (Capital + Aportes)", f"R$ {total_invested:,.2f}",
-                              delta=f"Lucro Estimado: R$ {final_equity - total_invested:,.2f}")
-                
-                st.plotly_chart(
-                    px.area(dca_df, y='Equity', title="Crescimento com Aportes Mensais",
-                            labels={'Equity': 'Patrimônio (R$)'},
-                            color_discrete_sequence=['#00CC96']),
-                    use_container_width=True
-                )
-            else:
-                st.info("Sem retornos históricos para simular DCA.")
-
-        with tab5:
-            st.subheader("Exportar Resultados")
-            col_e1, col_e2, col_e3 = st.columns(3)
-            
-            with col_e1:
-                csv_rank = ranked_current.to_csv().encode('utf-8')
-                st.download_button("📥 Ranking Completo", data=csv_rank,
-                                   file_name="factor_ranking.csv", mime="text/csv")
-            
-            with col_e2:
-                if not strategy_rets.empty:
-                    perf_export = pd.concat([
-                        (1 + strategy_rets).cumprod().rename("Estratégia"),
-                        (1 + bench_rets).cumprod().rename("BOVA11")
-                    ], axis=1)
-                    csv_perf = perf_export.to_csv().encode('utf-8')
-                    st.download_button("📥 Série de Retornos", data=csv_perf,
-                                       file_name="performance_historica.csv", mime="text/csv")
-            
-            with col_e3:
-                if not exec_df.empty:
-                    csv_exec = exec_df.to_csv().encode('utf-8')
-                    st.download_button("📥 Plano de Compras", data=csv_exec,
-                                       file_name="plano_execucao.csv", mime="text/csv")
-
-if __name__ == "__main__":
-    main()
+                c1, c2, c3,
