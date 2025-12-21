@@ -194,7 +194,7 @@ def compute_size_score(fund_df: pd.DataFrame) -> pd.Series:
     if 'marketCap' not in fund_df.columns: return pd.Series(dtype=float)
     mcap = fund_df['marketCap'].replace(0, np.nan)
     log_mcap = np.log(mcap)
-    return (-1 * log_mcap).rename("Size_Score")
+    return (-1 * (log_mcap - log_mcap.mean()) / log_mcap.std()).rename("Size_Score")  # Normalizado
 
 # ==============================================================================
 # MÓDULO 3: SCORING & NORMALIZAÇÃO (Advanced)
@@ -242,9 +242,9 @@ def enforce_constraints(weights: pd.Series, sector_series: pd.Series,
         w = w.clip(upper=max_asset_weight)
         w = w / w.sum()
         
-        if sector_series is not None:
+        if sector_series is not None and not sector_series.empty:
             df_w = w.to_frame('weight')
-            df_w['sector'] = sector_series.loc[w.index]
+            df_w['sector'] = sector_series.reindex(w.index).fillna('Unknown')
             sector_weights = df_w.groupby('sector')['weight'].sum()
             
             over_sectors = sector_weights[sector_weights > max_sector_weight].index
@@ -277,16 +277,8 @@ def optimize_portfolio(selected_tickers, cov_matrix, method='risk_parity'):
         res = minimize(risk_parity_obj, initial_weights, args=(cov_matrix), 
                        method='SLSQP', bounds=bounds, constraints=constraints)
         return pd.Series(res.x, index=selected_tickers)
-        
-    elif method == 'min_vol':
-        def min_vol_obj(w, cov):
-            return np.sqrt(w.T @ cov @ w)
-            
-        res = minimize(min_vol_obj, initial_weights, args=(cov_matrix), 
-                       method='SLSQP', bounds=bounds, constraints=constraints)
-        return pd.Series(res.x, index=selected_tickers)
-
-    return pd.Series(initial_weights, index=selected_tickers)
+    else:
+        return pd.Series(initial_weights, index=selected_tickers)
 
 def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame, 
                         config: dict, sector_series: pd.Series):
@@ -295,7 +287,8 @@ def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame,
     if not selected: return pd.Series()
     
     recent_rets = prices[selected].pct_change().tail(252).dropna()
-    if recent_rets.empty: return pd.Series(1/len(selected), index=selected)
+    if recent_rets.empty or len(recent_rets) < 30:
+        return pd.Series(1.0/len(selected), index=selected)
     cov_matrix = recent_rets.cov() * 252
 
     if config['method'] == 'risk_parity':
@@ -330,7 +323,7 @@ def calculate_metrics(daily_returns: pd.Series, risk_free=0.10):
     max_dd = drawdown.min()
     
     neg_rets = daily_returns[daily_returns < 0]
-    down_dev = neg_rets.std() * np.sqrt(252)
+    down_dev = neg_rets.std() * np.sqrt(252) if len(neg_rets) > 0 else vol
     sortino = (ann_ret - risk_free) / down_dev if down_dev > 0 else 0
     
     calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0
@@ -356,10 +349,9 @@ def run_backtest_engine(
     
     rebal_dates = prices.loc[start_date:end_date].resample('MS').first().index.tolist()
     
-    if not rebal_dates: return pd.DataFrame()
+    if not rebal_dates: return pd.Series()
 
     daily_rets = []
-    
     transaction_cost_pct = config.get('transaction_cost_pct', 0.002)
     prev_weights = pd.Series(dtype=float)
 
@@ -413,6 +405,9 @@ def run_backtest_engine(
         
         if not current_weights.empty and not period_pct.empty:
             common_tickers = list(set(current_weights.index) & set(period_pct.columns))
+            if not common_tickers:
+                daily_rets.append(pd.Series(0.0, index=period_pct.index))
+                continue
             strat_ret = period_pct[common_tickers].dot(current_weights[common_tickers])
             
             turnover = 0.0
@@ -441,24 +436,20 @@ def run_backtest_engine(
 # ==============================================================================
 # NOVO MÓDULO: GESTÃO DE CAPITAL E APORTES (DCA)
 # ==============================================================================
-def calculate_dca_history(strategy_rets, initial_capital, monthly_investment):
+def calculate_dca_history(strategy_rets: pd.Series, initial_capital: float, monthly_investment: float):
     """
-    Simula o crescimento do patrimônio considerando um aporte mensal fixo (DCA).
+    Simula crescimento com aportes mensais no início do mês.
     """
-    # Datas de início de cada mês no período do backtest
-    monthly_dates = strategy_rets.resample('MS').first().index
+    monthly_dates = strategy_rets.index.to_series().dt.is_month_start
     history = []
     current_balance = initial_capital
-   
-    for date in strategy_rets.index:
-        # Aporte no primeiro dia útil do mês
-        if date in monthly_dates:
+    
+    for date, ret in strategy_rets.items():
+        if monthly_dates.loc[date]:
             current_balance += monthly_investment
-           
-        # Aplica retorno diário
-        current_balance *= (1 + strategy_rets.loc[date])
+        current_balance *= (1 + ret)
         history.append({'Date': date, 'Equity': current_balance})
-       
+    
     return pd.DataFrame(history).set_index('Date')
 
 # ==============================================================================
@@ -468,24 +459,30 @@ def calculate_dca_history(strategy_rets, initial_capital, monthly_investment):
 def main():
     st.title("🧪 Quant Factor Lab Pro v2.0")
     st.markdown("""
-    **Institutional-Grade Screener & Backtester for B3.**
-    Engine atualizada com Winsorization, Risk Parity Otimizado, Filtros de Liquidez e Custos de Transação.
+    **Institutional-Grade Screener & Backtester for B3**  
+    Multifator, Risk Parity, Walk-Forward com custos, DCA e Plano de Execução.
     """)
 
     with st.sidebar:
         st.header("⚙️ Configuração do Universo")
         default_univ = "ITUB3.SA, VALE3.SA, PETR4.SA, WEGE3.SA, PRIO3.SA, BBAS3.SA, RENT3.SA, B3SA3.SA, SUZB3.SA, GGBR4.SA, JBSS3.SA, RAIL3.SA, VIVT3.SA, CPLE6.SA, PSSA3.SA, TOTS3.SA, EQTL3.SA, LREN3.SA, RADL3.SA, CMIG4.SA"
-        ticker_input = st.text_area("Tickers (CSV)", default_univ, height=80)
+        ticker_input = st.text_area("Tickers (separados por vírgula)", default_univ, height=100)
         tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
         
         st.divider()
         st.header("1. Definição de Alpha (Pesos)")
-        w_rm = st.slider("Residual Momentum", 0.0, 1.0, 0.30)
-        w_lv = st.slider("Low Volatility / Beta", 0.0, 1.0, 0.20)
-        w_fm = st.slider("Fundamental Momentum", 0.0, 1.0, 0.20)
-        w_val = st.slider("Value (Enhanced)", 0.0, 1.0, 0.20)
-        w_qual = st.slider("Quality", 0.0, 1.0, 0.10)
-        w_size = st.slider("Size (Small Cap Bias)", 0.0, 1.0, 0.00)
+        w_rm = st.slider("Residual Momentum", 0.0, 1.0, 0.30, 0.05)
+        w_lv = st.slider("Low Volatility / Beta", 0.0, 1.0, 0.20, 0.05)
+        w_fm = st.slider("Fundamental Momentum", 0.0, 1.0, 0.20, 0.05)
+        w_val = st.slider("Value (Enhanced)", 0.0, 1.0, 0.20, 0.05)
+        w_qual = st.slider("Quality", 0.0, 1.0, 0.10, 0.05)
+        w_size = st.slider("Size (Small Cap Bias)", 0.0, 1.0, 0.00, 0.05)
+        
+        total_weight = w_rm + w_lv + w_fm + w_val + w_qual + w_size
+        if total_weight > 0:
+            st.success(f"Peso total: {total_weight:.2f}")
+        else:
+            st.warning("Ajuste os pesos — soma deve ser > 0")
         
         factor_weights = {
             'Res_Mom': w_rm, 'Low_Vol': w_lv, 'Fund_Mom': w_fm, 
@@ -494,46 +491,48 @@ def main():
         
         st.divider()
         st.header("2. Normalização e Filtros")
-        use_rank_based = st.checkbox("Usar Rank-Based Scoring?", value=False, help="Se ativo, ignora Z-Score e usa percentis transformados.")
+        use_rank_based = st.checkbox("Usar Rank-Based Scoring?", value=False)
         min_liquidity = st.number_input("Liquidez Mínima Diária (R$)", value=3000000, step=500000, format="%d")
         
         st.divider()
         st.header("3. Construção de Portfólio")
         top_n = st.number_input("Top N Ativos", 5, 30, 10)
         weight_method = st.selectbox("Método de Pesos", ["Inverse Volatility", "Risk Parity (Opt)", "Equal Weight"])
-        max_asset_cap = st.slider("Cap Máximo por Ativo (%)", 0.05, 0.50, 0.15)
-        max_sector_cap = st.slider("Cap Máximo por Setor (%)", 0.10, 1.00, 0.35)
+        max_asset_cap = st.slider("Cap Máximo por Ativo (%)", 0.05, 0.50, 0.15, 0.01)
+        max_sector_cap = st.slider("Cap Máximo por Setor (%)", 0.10, 1.00, 0.35, 0.05)
         
         st.divider()
         st.header("4. Parâmetros de Backtest")
-        trans_cost = st.slider("Custo de Transação (%)", 0.0, 1.0, 0.20) / 100
+        trans_cost = st.slider("Custo de Transação (%)", 0.0, 1.0, 0.20, 0.05) / 100
         years_backtest = st.slider("Anos de Backtest", 1, 5, 3)
-        add_benchmarks = st.checkbox("Benchmarks Extras (^BVSP, IDIV)", False)
         
         st.divider()
         st.header("💰 Gestão de Capital")
-        capital_inicial = st.number_input("Capital Inicial (R$)", value=100000, step=10000)
-        aporte_mensal = st.number_input("Aporte Mensal (R$)", value=2000, step=500)
+        capital_inicial = st.number_input("Capital Inicial (R$)", value=100000, step=10000, format="%d")
+        aporte_mensal = st.number_input("Aporte Mensal (R$)", value=2000, step=500, format="%d")
         
-        run_btn = st.button("🚀 Executar Engine Quant", type="primary")
+        run_btn = st.button("🚀 Executar Engine Quant", type="primary", use_container_width=True)
 
     if run_btn:
         if not tickers:
-            st.error("Insira tickers válidos.")
+            st.error("Insira pelo menos um ticker válido.")
+            return
+        if total_weight == 0:
+            st.error("A soma dos pesos dos fatores deve ser maior que zero.")
             return
 
         with st.status("Processando Pipeline Quantitativo...", expanded=True) as status:
             end_date = datetime.now()
-            start_date = end_date - timedelta(days=365 * (years_backtest + 1))
+            start_date = end_date - timedelta(days=365 * (years_backtest + 2))  # +2 anos para momentum
             
-            st.write("📥 Baixando Dados de Mercado (Preço e Volume)...")
+            st.write("📥 Baixando Preços e Volume...")
             prices, volumes = fetch_market_data(tickers, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
             
-            st.write("📊 Baixando Fundamentos...")
+            st.write("📊 Baixando Dados Fundamentais...")
             fundamentals = fetch_fundamentals(tickers)
             
             if prices.empty or fundamentals.empty:
-                st.error("Falha na obtenção de dados.")
+                st.error("Falha ao obter dados. Verifique os tickers ou conexão.")
                 status.update(label="Erro", state="error")
                 return
 
@@ -554,7 +553,8 @@ def main():
             df_current['Value'] = val_score
             df_current['Quality'] = qual_score
             df_current['Size'] = size_score
-            if 'sector' in fundamentals.columns: df_current['Sector'] = fundamentals['sector']
+            if 'sector' in fundamentals.columns:
+                df_current['Sector'] = fundamentals['sector']
             
             avg_liq = volumes.tail(63).mean() * prices.tail(63).mean()
             liquid_tickers = avg_liq[avg_liq >= min_liquidity].index
@@ -576,7 +576,7 @@ def main():
                 sector_series=fundamentals['sector'] if 'sector' in fundamentals else None
             )
             
-            st.write("⏳ Rodando Backtest Walk-Forward com Custos...")
+            st.write("⏳ Executando Backtest Walk-Forward...")
             backtest_config = {
                 'start_date': end_date - timedelta(days=365 * years_backtest),
                 'factor_weights': factor_weights,
@@ -587,10 +587,33 @@ def main():
             }
             
             strategy_rets = run_backtest_engine(prices, fundamentals, backtest_config, volumes)
-            
             bench_rets = prices['BOVA11.SA'].pct_change().loc[strategy_rets.index]
             
-            status.update(label="Cálculos Finalizados!", state="complete", expanded=False)
+            status.update(label="Cálculos Concluídos!", state="complete")
+
+        # ======================================================================
+        # PREPARAÇÃO DO PLANO DE EXECUÇÃO
+        # ======================================================================
+        exec_df = pd.DataFrame()
+        total_allocated = 0.0
+        cash_residual = capital_inicial
+        
+        if not current_weights.empty:
+            last_prices = prices.iloc[-1]
+            exec_df = current_weights.to_frame('Peso (%)')
+            exec_df['Financeiro (R$)'] = exec_df['Peso (%)'] * capital_inicial
+            available_prices = last_prices.reindex(exec_df.index)
+            
+            missing_prices = available_prices.isna()
+            if missing_prices.any():
+                st.warning(f"Ativos sem cotação recente: {', '.join(exec_df.index[missing_prices])}")
+            
+            exec_df['Preço Atual (R$)'] = available_prices
+            exec_df['Cotas (Estimadas)'] = (exec_df['Financeiro (R$)'] / exec_df['Preço Atual (R$)'])
+            exec_df['Cotas (Estimadas)'] = exec_df['Cotas (Estimadas)'].fillna(0).astype(int)
+            
+            total_allocated = exec_df['Financeiro (R$)'].sum()
+            cash_residual = capital_inicial - total_allocated
 
         # ======================================================================
         # VISUALIZAÇÃO DOS RESULTADOS
@@ -604,22 +627,11 @@ def main():
             "💾 Exportar Dados"
         ])
         
-        # Preparar dataframe de execução (usado nas abas 4 e 5)
-        exec_df = pd.DataFrame()
-        if not current_weights.empty:
-            last_prices = prices.iloc[-1]
-            exec_df = current_weights.to_frame('Peso (%)')
-            exec_df['Financeiro (R$)'] = exec_df['Peso (%)'] * capital_inicial
-            available_prices = last_prices.reindex(exec_df.index)
-            exec_df['Preço Atual (R$)'] = available_prices
-            exec_df['Cotas (Estimadas)'] = (exec_df['Financeiro (R$)'] / exec_df['Preço Atual (R$)']).fillna(0).astype(int)
-
         with tab1:
             col1, col2 = st.columns([1.5, 1])
             with col1:
                 st.subheader("Top Picks (Composite Score)")
-                
-                disp_cols = ['Composite_Score', 'Sector'] + [c for c in ['Res_Mom_Norm', 'Low_Vol_Norm', 'Value_Norm'] if c in ranked_current.columns]
+                disp_cols = ['Composite_Score', 'Sector'] + [c for c in ranked_current.columns if '_Norm' in c][:3]
                 st.dataframe(
                     ranked_current[disp_cols].head(top_n).style.background_gradient(cmap='RdYlGn', subset=['Composite_Score']),
                     use_container_width=True
@@ -628,63 +640,75 @@ def main():
                 if not current_weights.empty:
                     st.subheader("Exposição Setorial")
                     df_w = current_weights.to_frame('Weight')
-                    df_w['Sector'] = fundamentals.loc[df_w.index, 'sector']
-                    fig_tree = px.treemap(df_w.reset_index(), path=['Sector', 'index'], values='Weight', 
+                    df_w['Sector'] = fundamentals.loc[df_w.index, 'sector'].fillna('Unknown')
+                    fig_tree = px.treemap(df_w.reset_index(), path=['Sector', 'ticker'], values='Weight',
                                           title="Alocação por Setor e Ativo")
                     st.plotly_chart(fig_tree, use_container_width=True)
 
             with col2:
-                st.subheader("Pesos do Portfólio Otimizado")
+                st.subheader("Pesos Otimizados")
                 if not current_weights.empty:
-                    w_df_disp = current_weights.to_frame("Peso")
-                    w_df_disp["Peso"] = w_df_disp["Peso"].map("{:.2%}".format)
-                    st.table(w_df_disp)
+                    w_disp = current_weights.to_frame("Peso")
+                    w_disp["Peso"] = w_disp["Peso"].map("{:.2%}".format)
+                    st.table(w_disp)
                     
                     avg_score = ranked_current['Composite_Score'].head(top_n).mean()
-                    if avg_score > 1.5:
-                        st.success("✅ Regime Favorável: High Factor Scores")
+                    if avg_score > 1.2:
+                        st.success("✅ Regime Favorável para os Fatores")
+                    elif avg_score > 0.5:
+                        st.info("ℹ️ Regime Neutro")
                     else:
-                        st.info("ℹ️ Regime Neutro/Fraco para Fatores")
+                        st.warning("⚠️ Regime Desfavorável")
 
         with tab2:
             st.subheader(f"Performance Histórica ({years_backtest} Anos)")
             if not strategy_rets.empty:
                 cum_strat = (1 + strategy_rets).cumprod()
                 cum_bench = (1 + bench_rets).cumprod()
-                
-                df_perf = pd.DataFrame({'Strategy': cum_strat, 'BOVA11': cum_bench})
+                df_perf = pd.DataFrame({'Estratégia': cum_strat, 'BOVA11': cum_bench})
                 
                 m_strat = calculate_metrics(strategy_rets)
                 m_bench = calculate_metrics(bench_rets)
                 
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Retorno Total", f"{m_strat['Total Return']:.2%}", delta=f"{m_strat['Total Return']-m_bench['Total Return']:.2%}")
-                c2.metric("Sharpe Ratio", f"{m_strat['Sharpe']:.2f}", delta=f"{m_strat['Sharpe']-m_bench['Sharpe']:.2f}")
-                c3.metric("Volatilidade", f"{m_strat['Volatility']:.2%}")
+                c1.metric("Retorno Total", f"{m_strat['Total Return']:.2%}", 
+                          delta=f"{m_strat['Total Return'] - m_bench['Total Return']:.2%}")
+                c2.metric("Sharpe Ratio", f"{m_strat['Sharpe']:.2f}", 
+                          delta=f"{m_strat['Sharpe'] - m_bench['Sharpe']:.2f}")
+                c3.metric("Volatilidade Anual", f"{m_strat['Volatility']:.2%}")
                 c4.metric("Max Drawdown", f"{m_strat['Max Drawdown']:.2%}")
                 
-                st.plotly_chart(px.line(df_perf, title="Evolução Patrimonial (Base 1.0)", color_discrete_map={'Strategy': '#00CC96', 'BOVA11': '#EF553B'}), use_container_width=True)
+                st.plotly_chart(px.line(df_perf, title="Evolução do Patrimônio (Base 1.0)",
+                                        color_discrete_map={'Estratégia': '#00CC96', 'BOVA11': '#EF553B'}),
+                                use_container_width=True)
                 
-                with st.expander("Métricas Avançadas (Tabela)"):
-                    metrics_df = pd.DataFrame([m_strat, m_bench], index=['Strategy', 'Benchmark']).T
-                    st.table(metrics_df.style.format("{:.2f}"))
+                with st.expander("Métricas Detalhadas"):
+                    metrics_df = pd.DataFrame([m_strat, m_bench], index=['Estratégia', 'Benchmark']).T
+                    st.dataframe(metrics_df.style.format("{:.2%}"), use_container_width=True)
 
         with tab3:
-            st.subheader("Análise de Fatores")
+            st.subheader("Correlação entre Fatores Normalizados")
             if not ranked_current.empty:
                 factor_cols = [c for c in ranked_current.columns if '_Norm' in c]
                 if factor_cols:
                     corr = ranked_current[factor_cols].corr()
-                    st.plotly_chart(px.imshow(corr, text_auto=True, color_continuous_scale='RdBu_r', title="Correlação entre Fatores (Universo Atual)"), use_container_width=True)
+                    fig = px.imshow(corr, text_auto=True, color_continuous_scale='RdBu_r',
+                                    title="Matriz de Correlação dos Fatores")
+                    st.plotly_chart(fig, use_container_width=True)
             
-            st.subheader("Dados Fundamentais Brutos")
-            st.dataframe(fundamentals)
+            st.subheader("Dados Fundamentais (Snapshot)")
+            st.dataframe(fundamentals.style.format("{:.2f}"), use_container_width=True)
 
         with tab4:
-            st.subheader("🎯 Ordem de Execução Atual")
-            st.markdown(f"Baseado em um capital de **R$ {capital_inicial:,.2f}**")
-           
-            if not current_weights.empty and not exec_df.empty:
+            st.subheader("🎯 Plano de Execução Atual")
+            st.markdown(f"**Capital Disponível: R$ {capital_inicial:,.2f}**")
+            
+            col_a1, col_a2, col_a3 = st.columns(3)
+            col_a1.metric("Alocado em Ativos", f"R$ {total_allocated:,.2f}")
+            col_a2.metric("Cash Residual", f"R$ {cash_residual:,.2f}")
+            col_a3.metric("Taxa de Alocação", f"{(total_allocated/capital_inicial):.2%}")
+            
+            if not exec_df.empty:
                 st.dataframe(
                     exec_df.style.format({
                         'Peso (%)': '{:.2%}',
@@ -693,50 +717,57 @@ def main():
                     }),
                     use_container_width=True
                 )
-           
+            else:
+                st.info("Nenhum ativo selecionado para o portfólio atual.")
+            
             st.divider()
-            st.subheader("⏳ Histórico de Acúmulo (DCA)")
-           
+            st.subheader("⏳ Simulação de Acúmulo com Aportes (DCA)")
+            
             if not strategy_rets.empty:
                 dca_df = calculate_dca_history(strategy_rets, capital_inicial, aporte_mensal)
-               
-                col_m1, col_m2 = st.columns(2)
-                final_equity = dca_df['Equity'].iloc[-1]
-                months_count = len(strategy_rets.resample('MS'))
+                monthly_dates = strategy_rets.index.to_series().dt.is_month_start
+                months_count = monthly_dates.sum()
                 total_invested = capital_inicial + (aporte_mensal * months_count)
-               
-                col_m1.metric("Patrimônio Final Est.", f"R$ {final_equity:,.2f}")
-                col_m2.metric("Total Investido", f"R$ {total_invested:,.2f}",
-                              delta=f"Lucro: R$ {final_equity - total_invested:,.2f}")
-               
+                final_equity = dca_df['Equity'].iloc[-1]
+                
+                col_d1, col_d2 = st.columns(2)
+                col_d1.metric("Patrimônio Final Estimado", f"R$ {final_equity:,.2f}")
+                col_d2.metric("Total Investido (Capital + Aportes)", f"R$ {total_invested:,.2f}",
+                              delta=f"Lucro Estimado: R$ {final_equity - total_invested:,.2f}")
+                
                 st.plotly_chart(
-                    px.area(dca_df, y='Equity', title="Crescimento do Patrimônio (Capital + Aportes + Retornos)",
-                            labels={'Equity': 'Saldo (R$)'},
+                    px.area(dca_df, y='Equity', title="Crescimento com Aportes Mensais",
+                            labels={'Equity': 'Patrimônio (R$)'},
                             color_discrete_sequence=['#00CC96']),
                     use_container_width=True
                 )
             else:
-                st.info("Backtest vazio – não há dados para simulação DCA.")
+                st.info("Sem retornos históricos para simular DCA.")
 
         with tab5:
             st.subheader("Exportar Resultados")
-            col_d1, col_d2, col_d3 = st.columns(3)
+            col_e1, col_e2, col_e3 = st.columns(3)
             
-            with col_d1:
+            with col_e1:
                 csv_rank = ranked_current.to_csv().encode('utf-8')
-                st.download_button("📥 Baixar Ranking Completo (CSV)", data=csv_rank, file_name="factor_ranking.csv", mime="text/csv")
+                st.download_button("📥 Ranking Completo", data=csv_rank,
+                                   file_name="factor_ranking.csv", mime="text/csv")
             
-            with col_d2:
+            with col_e2:
                 if not strategy_rets.empty:
-                    cum_strat = (1 + strategy_rets).cumprod().to_frame('Strategy')
-                    cum_bench = (1 + bench_rets).cumprod().to_frame('BOVA11')
-                    csv_perf = pd.concat([cum_strat, cum_bench], axis=1).to_csv().encode('utf-8')
-                    st.download_button("📥 Baixar Série de Retornos (CSV)", data=csv_perf, file_name="strategy_performance.csv", mime="text/csv")
+                    perf_export = pd.concat([
+                        (1 + strategy_rets).cumprod().rename("Estratégia"),
+                        (1 + bench_rets).cumprod().rename("BOVA11")
+                    ], axis=1)
+                    csv_perf = perf_export.to_csv().encode('utf-8')
+                    st.download_button("📥 Série de Retornos", data=csv_perf,
+                                       file_name="performance_historica.csv", mime="text/csv")
             
-            with col_d3:
+            with col_e3:
                 if not exec_df.empty:
                     csv_exec = exec_df.to_csv().encode('utf-8')
-                    st.download_button("📥 Exportar Plano de Compras (CSV)", data=csv_exec, file_name="plano_execucao.csv", mime="text/csv")
+                    st.download_button("📥 Plano de Compras", data=csv_exec,
+                                       file_name="plano_execucao.csv", mime="text/csv")
 
 if __name__ == "__main__":
     main()
