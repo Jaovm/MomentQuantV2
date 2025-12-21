@@ -233,60 +233,97 @@ def robust_zscore(series: pd.Series) -> pd.Series:
 def run_honest_backtest(
     prices: pd.DataFrame, 
     valid_tickers: list, 
-    lookback_days: int = 252*2
+    lookback_days: int = 252
 ):
     """
     Backtest 'Honesto':
-    1. Usa o universo de tickers filtrado pela QUALIDADE ATUAL (Survivorship bias aceito para screening).
-    2. Aplica estratégia puramente TÉCNICA (Momentum + HRP) no passado.
+    1. Usa o universo de tickers filtrado pela QUALIDADE ATUAL.
+    2. Aplica historicamente apenas sinais de Preço (Momentum + HRP).
     """
-    subset_prices = prices[valid_tickers + ['BOVA11.SA']].dropna(how='all')
-    rebalance_dates = subset_prices.resample('MS').first().index[12:] # Pula 1 ano para buffer
+    # Garante que temos as colunas necessárias
+    cols_to_use = [t for t in valid_tickers if t in prices.columns]
+    if 'BOVA11.SA' in prices.columns and 'BOVA11.SA' not in cols_to_use:
+        cols_to_use.append('BOVA11.SA')
+        
+    subset_prices = prices[cols_to_use].dropna(how='all')
+    
+    # Se não houver dados suficientes no total, retorna vazio
+    if len(subset_prices) < lookback_days:
+        return pd.DataFrame()
+
+    # Pula o período inicial de "aquecimento" (lookback)
+    rebalance_dates = subset_prices.resample('MS').first().index
+    rebalance_dates = [d for d in rebalance_dates if d >= subset_prices.index[0] + timedelta(days=lookback_days)]
     
     history = []
     
     for date in rebalance_dates:
         # Janela de dados disponível NAQUELA DATA
-        hist_window = subset_prices.loc[:date].tail(252)
-        if len(hist_window) < 100: continue
+        hist_window = subset_prices.loc[:date].tail(lookback_days)
+        
+        # --- CORREÇÃO DO ERRO ---
+        # Verifica se temos EXATAMENTE a quantidade de dias necessária para o iloc[-252]
+        if len(hist_window) < lookback_days: 
+            continue
             
         # Calcula Momentum (Sinal Técnico disponível no passado)
-        # Momentum 12-1
-        ret_12m = hist_window.iloc[-21] / hist_window.iloc[-252] - 1
+        # Momentum 12-1 (Preço de 1 mês atrás / Preço de 12 meses atrás - 1)
+        try:
+            # iloc[-21] = aprox 1 mês atrás
+            # iloc[-lookback_days] = início da janela (12 meses atrás)
+            price_1m_ago = hist_window.iloc[-21]
+            price_12m_ago = hist_window.iloc[0] # Como usamos tail(lookback), o índice 0 é o mais antigo
+            
+            # Evita divisão por zero ou nulos
+            ret_12m = (price_1m_ago / price_12m_ago - 1).dropna()
+        except IndexError:
+            continue
         
         # Ranking Top 25% Momentum
-        top_cut = int(len(valid_tickers) * 0.25)
+        # Filtra apenas tickers que têm dados válidos de momentum
+        available_tickers = [t for t in ret_12m.index if t in valid_tickers and t != 'BOVA11.SA']
+        
+        if not available_tickers:
+            continue
+
+        top_cut = int(len(available_tickers) * 0.25)
         if top_cut < 3: top_cut = 3
         
-        selection = ret_12m.sort_values(ascending=False).head(top_cut).index.tolist()
-        selection = [t for t in selection if t != 'BOVA11.SA']
+        selection = ret_12m.loc[available_tickers].sort_values(ascending=False).head(top_cut).index.tolist()
         
         if not selection: continue
             
         # Alocação de Risco (HRP)
         try:
             curr_prices = hist_window[selection].tail(60) # Curta janela para covariância
-            weights = get_hrp_weights(curr_prices)
+            if len(curr_prices) < 30: # Proteção extra para covariância
+                weights = pd.Series(1/len(selection), index=selection)
+            else:
+                weights = get_hrp_weights(curr_prices)
         except:
             weights = pd.Series(1/len(selection), index=selection)
             
         # Retorno do próximo mês
         next_date = date + timedelta(days=30)
-        future_rets = subset_prices.loc[date:next_date].pct_change().dropna()
+        # CORREÇÃO DO WARNING: fill_method=None
+        future_rets = subset_prices.loc[date:next_date].pct_change(fill_method=None).dropna()
         
         if not future_rets.empty:
-            strat_ret = (future_rets[weights.index] * weights).sum(axis=1)
-            bova_ret = future_rets['BOVA11.SA']
-            
-            df_ret = pd.DataFrame({'Strategy': strat_ret, 'BOVA11': bova_ret})
-            history.append(df_ret)
+            # Alinha pesos com colunas disponíveis no futuro (caso algum ativo pare de negociar)
+            valid_w_assets = [a for a in weights.index if a in future_rets.columns]
+            if valid_w_assets:
+                strat_ret = (future_rets[valid_w_assets] * weights[valid_w_assets]).sum(axis=1)
+                bova_ret = future_rets['BOVA11.SA'] if 'BOVA11.SA' in future_rets.columns else pd.Series(0, index=future_rets.index)
+                
+                df_ret = pd.DataFrame({'Strategy': strat_ret, 'BOVA11': bova_ret})
+                history.append(df_ret)
             
     if history:
         full_ret = pd.concat(history)
         full_ret = full_ret[~full_ret.index.duplicated()]
         return (1 + full_ret).cumprod()
+    
     return pd.DataFrame()
-
 # ==============================================================================
 # 5. APP PRINCIPAL
 # ==============================================================================
