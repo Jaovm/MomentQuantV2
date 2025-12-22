@@ -326,8 +326,7 @@ def run_dca_backtest(
         df_period['Quality'] = qual_score
         
         if 'sector' in fundamentals_at_rebal.columns: 
-             df_period['Sector'] = fundamentals_at_rebal['sector']ector' in fundamentals_at_rebal.columns: 
-             df_period['Sector'] = fundamentals_at_rebal['sector']ebal['sector']
+             df_period['Sector'] = fundamentals_at_rebal['sector']
         
         df_period.dropna(thresh=2, inplace=True)
         norm_cols = ['Res_Mom', 'Fund_Mom', 'Value', 'Quality']
