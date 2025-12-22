@@ -185,7 +185,7 @@ def main():
 
     st.sidebar.header("⚙️ Configurações")
     univ = st.sidebar.text_area("Universo de Ativos (vírgula)", 
-                                "ITUB4, VALE3, WEGE3, PETR4, BBAS3, JBSS3, RENT3, PRIO3, B3SA3, GGBR4", 
+                                "ITUB3, TOTS3, MDIA3, TAEE3, BBSE3, WEGE3, PSSA3, EGIE3, B3SA3, VIVT3, AGRO3, PRIO3, BBAS3, BPAC11, SBSP3, SAPR4, CMIG3, UNIP6, FRAS3", 
                                 height=100)
    
     st.sidebar.subheader("Pesos dos Fatores (soma não precisa ser 1)")
