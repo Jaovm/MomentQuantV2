@@ -4,496 +4,487 @@ import numpy as np
 import yfinance as yf
 import statsmodels.api as sm
 import plotly.express as px
-import plotly.graph_objects as go
-import scipy.cluster.hierarchy as sch
-from scipy.spatial.distance import squareform
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
+import fundamentus  # Biblioteca necessária: pip install fundamentus
 
 # ==============================================================================
-# 0. CONFIGURAÇÃO DA PÁGINA E ESTILO
+# CONFIGURAÇÃO DA PÁGINA
 # ==============================================================================
 st.set_page_config(
-    page_title="SPX Quant Lab | Decision Support",
+    page_title="Quant Factor Lab Pro (Fundamentus)",
     layout="wide",
-    initial_sidebar_state="expanded",
-    page_icon="📈"
+    initial_sidebar_state="expanded"
 )
 
-# CSS Customizado para visual "Dark Professional"
-st.markdown("""
-    <style>
-    .metric-card {background-color: #0E1117; border: 1px solid #303030; padding: 20px; border-radius: 10px;}
-    </style>
-    """, unsafe_allow_html=True)
-
 # ==============================================================================
-# 1. ENGINE DE DADOS (PARALELISMO & PERFORMANCE)
+# MÓDULO 1: DATA FETCHING (Busca de Dados)
 # ==============================================================================
 
 @st.cache_data(ttl=3600*12)
 def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFrame:
-    """Busca histórico de preços ajustados com tratamento de MultiIndex."""
-    t_list = list(set(tickers))
-    if 'BOVA11.SA' not in t_list:
-        t_list.append('BOVA11.SA')
+    """Busca histórico de preços ajustados, garantindo o benchmark BOVA11.SA."""
+    t_list = list(tickers)
+    # Tratamento para tickers do fundamentus que não têm .SA, se necessário, ou vice-versa
+    # O yfinance exige .SA. O input do usuário deve conter .SA ou tratamos aqui.
+    t_list_sa = [t if t.endswith('.SA') else f"{t}.SA" for t in t_list]
+    
+    if 'BOVA11.SA' not in t_list_sa:
+        t_list_sa.append('BOVA11.SA')
     
     try:
         data = yf.download(
-            t_list, 
+            t_list_sa, 
             start=start_date, 
             end=end_date, 
             progress=False,
             auto_adjust=False
         )['Adj Close']
         
-        # Tratamento para mudanças recentes na API do yfinance
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
             
         return data.dropna(how='all')
     except Exception as e:
-        st.error(f"Erro crítico no download de preços: {e}")
+        st.error(f"Erro ao baixar preços: {e}")
         return pd.DataFrame()
 
-def get_single_ticker_info(ticker: str):
-    """Função auxiliar para thread worker."""
-    try:
-        return yf.Ticker(ticker).info
-    except:
-        return None
-
 @st.cache_data(ttl=3600*24)
-def fetch_fundamentals_parallel(tickers: list) -> pd.DataFrame:
-    """Busca fundamentalista assíncrona (Multithreading)."""
-    clean_tickers = [t for t in tickers if t != 'BOVA11.SA']
-    data = []
-    
-    # Execução Paralela (IO-Bound optimization)
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        results = list(executor.map(get_single_ticker_info, clean_tickers))
+def fetch_fundamentals_fundamentus(tickers: list) -> pd.DataFrame:
+    """
+    Busca snapshots fundamentais usando a biblioteca 'fundamentus'.
+    Retorna dataframe com colunas padronizadas.
+    """
+    try:
+        # Busca dados brutos (retorna todos os papéis disponíveis)
+        df_raw = fundamentus.get_resultado()
         
-    for i, info in enumerate(results):
-        if info:
-            t = clean_tickers[i]
-            # Setorização Inteligente
-            sector = info.get('sector', 'Unknown')
-            if sector in ['Unknown', 'N/A'] and 'longName' in info:
-                 name = info['longName'].lower()
-                 if 'banco' in name or 'seguridade' in name: sector = 'Financial Services'
-                 elif 'energia' in name or 'elétrica' in name: sector = 'Utilities'
-            
-            # Métricas Calculadas
-            ebitda = info.get('ebitda', np.nan)
-            ev = info.get('enterpriseValue', np.nan)
-            ev_ebitda = ev / ebitda if (ebitda and ev and ebitda > 0) else np.nan
-            
-            # Accruals (Qualidade do Lucro)
-            net_income = info.get('netIncomeToCommon', np.nan)
-            ocf = info.get('operatingCashflow', np.nan)
-            assets = info.get('totalAssets', np.nan)
-            accruals = (net_income - ocf) / assets if (assets and assets > 0) else 0
+        # Limpa tickers de entrada (remove .SA para bater com o index do fundamentus)
+        clean_tickers = [t.replace('.SA', '') for t in tickers]
+        
+        # Filtra apenas os tickers solicitados que existem na base
+        valid_tickers = [t for t in clean_tickers if t in df_raw.index]
+        df = df_raw.loc[valid_tickers].copy()
+        
+        # Mapeamento e conversão de colunas
+        # Fundamentus retorna strings em alguns casos, mas a lib 'fundamentus' geralmente já trata para float.
+        # Ajustamos nomes para o padrão do script
+        df_final = pd.DataFrame()
+        df_final['sector'] = 'Unknown' # Fundamentus (get_resultado) não traz setor direto, teria que usar get_papel. 
+                                     # Mantemos placeholder ou buscamos detalhe se crítico.
+        
+        # Valuation
+        df_final['pl'] = pd.to_numeric(df['pl'], errors='coerce')
+        df_final['pvp'] = pd.to_numeric(df['pvp'], errors='coerce')
+        df_final['evebitda'] = pd.to_numeric(df['evebitda'], errors='coerce')
+        
+        # Qualidade / Rentabilidade
+        df_final['roe'] = pd.to_numeric(df['roe'], errors='coerce')
+        df_final['mrgebit'] = pd.to_numeric(df['mrgebit'], errors='coerce')
+        df_final['mrgliq'] = pd.to_numeric(df['mrgliq'], errors='coerce')
+        df_final['div_bruta_patrim'] = pd.to_numeric(df['div_bruta/patrim'], errors='coerce')
+        
+        # Crescimento (Revenue Growth 5y)
+        df_final['cresc_rec5'] = pd.to_numeric(df['cres_rec5'], errors='coerce')
 
-            data.append({
-                'ticker': t,
-                'sector': sector,
-                'forwardPE': info.get('forwardPE', np.nan),
-                'evToEbitda': info.get('enterpriseToEbitda', ev_ebitda),
-                'returnOnEquity': info.get('returnOnEquity', np.nan),
-                'profitMargins': info.get('profitMargins', np.nan),
-                'debtToEquity': info.get('debtToEquity', np.nan),
-                'earningsGrowth': info.get('earningsGrowth', np.nan),
-                'revenueGrowth': info.get('revenueGrowth', np.nan),
-                'accruals': accruals # Menor é melhor
-            })
-    
-    if not data: return pd.DataFrame()
-    return pd.DataFrame(data).set_index('ticker')
+        # Adicionar o sufixo .SA novamente para compatibilidade com YFinance
+        df_final.index = [f"{x}.SA" for x in df_final.index]
+        
+        return df_final
+
+    except Exception as e:
+        st.error(f"Erro ao buscar dados do Fundamentus: {e}")
+        return pd.DataFrame()
 
 # ==============================================================================
-# 2. MATH & FACTORS (ALPHA GENERATION)
+# MÓDULO 2: CÁLCULO DE FATORES (Math & Logic)
 # ==============================================================================
 
 def compute_residual_momentum(price_df: pd.DataFrame, lookback=12, skip=1) -> pd.Series:
-    """Alpha Puro: Momentum descontando o Beta do Mercado."""
+    """Calcula Residual Momentum (Alpha) vs BOVA11.SA."""
     df = price_df.copy()
     monthly = df.resample('ME').last()
     rets = monthly.pct_change().dropna()
     
     if 'BOVA11.SA' not in rets.columns: return pd.Series(dtype=float)
+        
     market = rets['BOVA11.SA']
-    
     scores = {}
     window = lookback + skip
     
     for ticker in rets.columns:
         if ticker == 'BOVA11.SA': continue
+        
         y = rets[ticker].tail(window)
         x = market.tail(window)
+        
         if len(y) < window: continue
+            
         try:
-            model = sm.OLS(y.values, sm.add_constant(x.values)).fit()
+            X = sm.add_constant(x.values)
+            model = sm.OLS(y.values, X).fit()
             resid = model.resid[:-skip]
-            # Ajuste pelo risco idiossincrático (Sharpe do Resíduo)
-            scores[ticker] = (np.sum(resid) / np.std(resid)) if np.std(resid) > 0 else 0
+            
+            if np.std(resid) == 0 or len(resid) < 2:
+                scores[ticker] = 0
+            else:
+                scores[ticker] = np.sum(resid) / np.std(resid)
         except:
             scores[ticker] = 0
             
     return pd.Series(scores, name='Residual_Momentum')
 
-def compute_fundamental_factors(fund_df: pd.DataFrame) -> pd.DataFrame:
-    """Calcula Scores Fundamentais Normalizados."""
-    df = fund_df.copy()
+def compute_fundamental_momentum(fund_df: pd.DataFrame) -> pd.Series:
+    """Z-Score de crescimento de Receita (5 anos) - Dado disponível no Fundamentus."""
+    # Fundamentus gratuito foca mais em Snapshot. Usaremos Cresc Rec 5 Anos como proxy.
+    scores = pd.DataFrame(index=fund_df.index)
     
-    # 1. Fundamental Momentum (Growth)
-    metrics_growth = ['earningsGrowth', 'revenueGrowth']
-    df['Fund_Mom'] = 0
-    for m in metrics_growth:
-        if m in df.columns:
-            s = df[m].fillna(df[m].median())
-            df['Fund_Mom'] += (s - s.mean()) / s.std()
+    if 'cresc_rec5' in fund_df:
+        s = fund_df['cresc_rec5'].fillna(fund_df['cresc_rec5'].median())
+        scores['Growth'] = (s - s.mean()) / s.std()
+    else:
+        scores['Growth'] = 0.0
+        
+    return scores.mean(axis=1).rename("Fundamental_Momentum")
+
+def compute_value_score(fund_df: pd.DataFrame) -> pd.Series:
+    """Score de Valor: Inverso de P/E (P/L) e P/B (P/VP)."""
+    scores = pd.DataFrame(index=fund_df.index)
+    # Earning Yield (1/PL)
+    if 'pl' in fund_df: 
+        scores['EP'] = np.where(fund_df['pl'] > 0, 1/fund_df['pl'], 0)
+    # Book Yield (1/PVP)
+    if 'pvp' in fund_df: 
+        scores['BP'] = np.where(fund_df['pvp'] > 0, 1/fund_df['pvp'], 0)
     
-    # 2. Value (Earnings Yield & EV/EBITDA Inverso)
-    # Preferimos EV/EBITDA. Se for alto, é caro (score baixo).
-    # Tratamento: Inverter valor. Se negativo, penalizar.
-    ev_score = df['evToEbitda'].fillna(df['evToEbitda'].median())
-    df['Value_Score'] = np.where(ev_score > 0, 1/ev_score, -1) # Quanto maior o inverso, mais barato
+    return scores.mean(axis=1).rename("Value_Score")
+
+def compute_quality_score(fund_df: pd.DataFrame) -> pd.Series:
+    """Score de Qualidade: ROE, Margem Liq e Baixa Alavancagem."""
+    scores = pd.DataFrame(index=fund_df.index)
+    if 'roe' in fund_df: scores['ROE'] = fund_df['roe']
+    if 'mrgliq' in fund_df: scores['PM'] = fund_df['mrgliq']
+    # Dívida/Patrimônio (quanto menor melhor, então multiplicamos por -1)
+    if 'div_bruta_patrim' in fund_df: scores['DE_Inv'] = -1 * fund_df['div_bruta_patrim']
     
-    # 3. Quality (ROE + Margem - Alavancagem - Accruals)
-    roe = df['returnOnEquity'].fillna(0)
-    accruals = df['accruals'].fillna(0) # Queremos accruals baixos (lucro caixa)
-    lev = df['debtToEquity'].fillna(100)
-    
-    # Z-Score simples para combinação interna
-    z_roe = (roe - roe.mean()) / roe.std()
-    z_acc = -1 * (accruals - accruals.mean()) / accruals.std() # Inverte sinal
-    z_lev = -1 * (lev - lev.mean()) / lev.std() # Inverte sinal (menos dívida é melhor)
-    
-    df['Quality_Score'] = (z_roe + z_acc + z_lev) / 3
-    
-    return df[['Fund_Mom', 'Value_Score', 'Quality_Score']]
+    return scores.mean(axis=1).rename("Quality_Score")
 
 # ==============================================================================
-# 3. GESTÃO DE RISCO (HIERARCHICAL RISK PARITY)
-# ==============================================================================
-
-def get_hrp_weights(price_data: pd.DataFrame) -> pd.Series:
-    """
-    Calcula pesos via Hierarchical Risk Parity (HRP).
-    Diferencial: Não penaliza diversificação em clusters correlacionados.
-    """
-    rets = price_data.pct_change().dropna()
-    cov = rets.cov()
-    corr = rets.corr()
-    
-    # 1. Clustering Hierárquico
-    dist = np.sqrt((1 - corr) / 2)
-    link = sch.linkage(squareform(dist.clip(0, 1)), 'single')
-    
-    # 2. Quasi-Diagonalization (Reordenar matriz para agrupar clusters)
-    def get_quasi_diag(link):
-        link = link.astype(int)
-        sort_ix = pd.Series([link[-1, 0], link[-1, 1]])
-        num_items = link[-1, 3]
-        while sort_ix.max() >= num_items:
-            sort_ix.index = range(0, sort_ix.shape[0] * 2, 2)
-            df0 = sort_ix[sort_ix >= num_items]
-            i = df0.index
-            j = df0.values - num_items
-            sort_ix[i] = link[j, 0]
-            df0 = pd.Series(link[j, 1], index=i + 1)
-            sort_ix = pd.concat([sort_ix, df0])
-            sort_ix = sort_ix.sort_index()
-            sort_ix.index = range(sort_ix.shape[0])
-        return sort_ix.tolist()
-    
-    sort_ix = get_quasi_diag(link)
-    sorted_tickers = corr.index[sort_ix].tolist()
-    
-    # 3. Recursive Bisection (Simplificado: Inverse Variance na ordem clusterizada)
-    # Isso garante que o risco flua suavemente entre clusters
-    cov_sorted = cov.loc[sorted_tickers, sorted_tickers]
-    inv_var = 1 / np.diag(cov_sorted)
-    weights = inv_var / inv_var.sum()
-    
-    return pd.Series(weights, index=sorted_tickers).sort_values(ascending=False)
-
-# ==============================================================================
-# 4. BACKTEST ENGINE (LÓGICA HÍBRIDA)
+# MÓDULO 3: SCORING & NORMALIZAÇÃO & AUXILIARES
 # ==============================================================================
 
 def robust_zscore(series: pd.Series) -> pd.Series:
-    """Robust Z-Score usando MAD (Median Absolute Deviation)."""
+    """Z-Score Robusto."""
     series = series.replace([np.inf, -np.inf], np.nan)
     median = series.median()
     mad = (series - median).abs().median()
-    if mad == 0: return series - median
-    return ((series - median) / (mad * 1.4826)).clip(-3, 3)
+    if mad == 0 or mad < 1e-6: return series - median 
+    z = (series - median) / (mad * 1.4826) 
+    return z.clip(-3, 3) 
 
-def run_honest_backtest(
-    prices: pd.DataFrame, 
-    valid_tickers: list, 
-    lookback_days: int = 252
+def build_composite_score(df_master: pd.DataFrame, weights: dict) -> pd.DataFrame:
+    """Calcula score final ponderado."""
+    df = df_master.copy()
+    df['Composite_Score'] = 0.0
+    for factor_col, weight in weights.items():
+        if factor_col in df.columns:
+            df['Composite_Score'] += df[factor_col].fillna(0) * weight
+            
+    return df.sort_values('Composite_Score', ascending=False)
+
+def get_implied_per_share_metrics(prices_current: pd.Series, fundamentals_current: pd.DataFrame) -> pd.DataFrame:
+    """
+    Engenharia Reversa para Backtest:
+    Calcula LPA (EPS) e VPA (BVPS) implícitos atuais para usar com preços históricos.
+    LPA = Preço_Atual / PL_Atual
+    VPA = Preço_Atual / PVP_Atual
+    """
+    metrics = pd.DataFrame(index=fundamentals_current.index)
+    common_idx = prices_current.index.intersection(fundamentals_current.index)
+    
+    p = prices_current[common_idx]
+    f = fundamentals_current.loc[common_idx]
+    
+    # Evita divisão por zero
+    metrics.loc[common_idx, 'Implied_EPS'] = np.where(f['pl'] != 0, p / f['pl'], np.nan)
+    metrics.loc[common_idx, 'Implied_BVPS'] = np.where(f['pvp'] != 0, p / f['pvp'], np.nan)
+    
+    return metrics
+
+# ==============================================================================
+# MÓDULO 4: PORTFOLIO & BACKTEST (CORRIGIDO PARA DADOS DINÂMICOS DE PREÇO)
+# ==============================================================================
+
+def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame, top_n: int, vol_target: float = None):
+    selected = ranked_df.head(top_n).index.tolist()
+    if not selected: return pd.Series()
+
+    if vol_target is not None:
+        recent_rets = prices[selected].pct_change().tail(63)
+        vols = recent_rets.std() * (252**0.5)
+        vols[vols == 0] = 1e-6 
+        raw_weights_inv = 1 / vols
+        weights = raw_weights_inv / raw_weights_inv.sum() 
+    else:
+        weights = pd.Series(1.0/len(selected), index=selected)
+        
+    return weights.sort_values(ascending=False)
+
+def run_dynamic_backtest(
+    all_prices: pd.DataFrame, 
+    all_fundamentals_snapshot: pd.DataFrame, 
+    weights_config: dict, 
+    top_n: int, 
+    use_vol_target: bool,
+    start_date_backtest: datetime
 ):
     """
-    Backtest 'Honesto':
-    1. Usa o universo de tickers filtrado pela QUALIDADE ATUAL.
-    2. Aplica historicamente apenas sinais de Preço (Momentum + HRP).
+    Executa Backtest Walk-Forward.
+    IMPORTANTE: Usa 'Implied Metrics' para reconstruir múltiplos de valor baseados no preço histórico.
     """
-    # Garante que temos as colunas necessárias
-    cols_to_use = [t for t in valid_tickers if t in prices.columns]
-    if 'BOVA11.SA' in prices.columns and 'BOVA11.SA' not in cols_to_use:
-        cols_to_use.append('BOVA11.SA')
-        
-    subset_prices = prices[cols_to_use].dropna(how='all')
+    end_date = all_prices.index[-1]
     
-    # Se não houver dados suficientes no total, retorna vazio
-    if len(subset_prices) < lookback_days:
-        return pd.DataFrame()
+    # 1. Preparar Métricas Fixas (LPA, VPA) baseadas no último preço disponível
+    last_prices = all_prices.iloc[-1]
+    implied_metrics = get_implied_per_share_metrics(last_prices, all_fundamentals_snapshot)
+    
+    subset_prices = all_prices.loc[start_date_backtest - timedelta(days=400):end_date]
+    rebalance_dates = subset_prices.loc[start_date_backtest:end_date].resample('MS').first().index.tolist()
+    
+    if not rebalance_dates: return pd.DataFrame()
 
-    # Pula o período inicial de "aquecimento" (lookback)
-    rebalance_dates = subset_prices.resample('MS').first().index
-    rebalance_dates = [d for d in rebalance_dates if d >= subset_prices.index[0] + timedelta(days=lookback_days)]
-    
-    history = []
-    
-    for date in rebalance_dates:
-        # Janela de dados disponível NAQUELA DATA
-        hist_window = subset_prices.loc[:date].tail(lookback_days)
-        
-        # --- CORREÇÃO DO ERRO ---
-        # Verifica se temos EXATAMENTE a quantidade de dias necessária para o iloc[-252]
-        if len(hist_window) < lookback_days: 
-            continue
-            
-        # Calcula Momentum (Sinal Técnico disponível no passado)
-        # Momentum 12-1 (Preço de 1 mês atrás / Preço de 12 meses atrás - 1)
-        try:
-            # iloc[-21] = aprox 1 mês atrás
-            # iloc[-lookback_days] = início da janela (12 meses atrás)
-            price_1m_ago = hist_window.iloc[-21]
-            price_12m_ago = hist_window.iloc[0] # Como usamos tail(lookback), o índice 0 é o mais antigo
-            
-            # Evita divisão por zero ou nulos
-            ret_12m = (price_1m_ago / price_12m_ago - 1).dropna()
-        except IndexError:
-            continue
-        
-        # Ranking Top 25% Momentum
-        # Filtra apenas tickers que têm dados válidos de momentum
-        available_tickers = [t for t in ret_12m.index if t in valid_tickers and t != 'BOVA11.SA']
-        
-        if not available_tickers:
-            continue
+    strategy_daily_rets = []
+    benchmark_daily_rets = []
 
-        top_cut = int(len(available_tickers) * 0.25)
-        if top_cut < 3: top_cut = 3
+    for i, rebal_date in enumerate(rebalance_dates):
+        next_date = rebalance_dates[i+1] if i < len(rebalance_dates) - 1 else end_date
         
-        selection = ret_12m.loc[available_tickers].sort_values(ascending=False).head(top_cut).index.tolist()
+        # Dados Históricos no momento do rebalanceamento
+        prices_historical = subset_prices.loc[:rebal_date]
+        current_prices_at_rebal = prices_historical.iloc[-1]
         
-        if not selection: continue
-            
-        # Alocação de Risco (HRP)
-        try:
-            curr_prices = hist_window[selection].tail(60) # Curta janela para covariância
-            if len(curr_prices) < 30: # Proteção extra para covariância
-                weights = pd.Series(1/len(selection), index=selection)
-            else:
-                weights = get_hrp_weights(curr_prices)
-        except:
-            weights = pd.Series(1/len(selection), index=selection)
-            
-        # Retorno do próximo mês
-        next_date = date + timedelta(days=30)
-        # CORREÇÃO DO WARNING: fill_method=None
-        future_rets = subset_prices.loc[date:next_date].pct_change(fill_method=None).dropna()
+        # --- CÁLCULO DE FATORES DINÂMICOS ---
         
-        if not future_rets.empty:
-            # Alinha pesos com colunas disponíveis no futuro (caso algum ativo pare de negociar)
-            valid_w_assets = [a for a in weights.index if a in future_rets.columns]
-            if valid_w_assets:
-                strat_ret = (future_rets[valid_w_assets] * weights[valid_w_assets]).sum(axis=1)
-                bova_ret = future_rets['BOVA11.SA'] if 'BOVA11.SA' in future_rets.columns else pd.Series(0, index=future_rets.index)
-                
-                df_ret = pd.DataFrame({'Strategy': strat_ret, 'BOVA11': bova_ret})
-                history.append(df_ret)
+        # 1. Momentum (Sempre dinâmico pois depende só de preço)
+        mom_window = prices_historical.tail(400) 
+        risk_window = prices_historical.tail(90)
+        res_mom = compute_residual_momentum(mom_window)
+        
+        # 2. Value (Semi-Dinâmico: Preço Histórico / LPA fixo)
+        # Recria o dataframe de fundamentos para esta data
+        df_period = pd.DataFrame(index=all_prices.columns.drop('BOVA11.SA', errors='ignore'))
+        
+        # Value Score Reconstruído
+        # P/L Histórico = Preço na Data / LPA Implícito
+        # P/VP Histórico = Preço na Data / VPA Implícito
+        
+        # Merge com métricas implícitas
+        df_calc = df_period.join(implied_metrics)
+        df_calc['Price_Rebal'] = current_prices_at_rebal
+        
+        df_period['pl_est'] = df_calc['Price_Rebal'] / df_calc['Implied_EPS']
+        df_period['pvp_est'] = df_calc['Price_Rebal'] / df_calc['Implied_BVPS']
+        
+        # Calcula Score de Valor com dados estimados
+        val_score = pd.Series(0.0, index=df_period.index)
+        # Inverso de PL estimado
+        s_ep = np.where((df_period['pl_est'] > 0) & (df_period['pl_est'] < 200), 1/df_period['pl_est'], 0)
+        s_bp = np.where((df_period['pvp_est'] > 0) & (df_period['pvp_est'] < 20), 1/df_period['pvp_est'], 0)
+        val_score = (pd.Series(s_ep, index=df_period.index) + pd.Series(s_bp, index=df_period.index)) / 2
+        val_score = val_score.fillna(0)
+
+        # 3. Quality & Fundamental Momentum (Estáticos - Limitação da API Gratuita)
+        # Usamos os dados do snapshot como "melhor estimativa disponível" para qualidade estrutural
+        fund_mom = compute_fundamental_momentum(all_fundamentals_snapshot)
+        qual_score = compute_quality_score(all_fundamentals_snapshot)
+        
+        # --- MONTAGEM DO DATAFRAME DE RANKING ---
+        df_period['Res_Mom'] = res_mom
+        df_period['Fund_Mom'] = fund_mom
+        df_period['Value'] = val_score
+        df_period['Quality'] = qual_score
+        
+        df_period.dropna(thresh=2, inplace=True)
+        
+        # Normalização e Ponderação
+        norm_cols = ['Res_Mom', 'Fund_Mom', 'Value', 'Quality']
+        w_keys = {}
+        
+        for c in norm_cols:
+            if c in df_period.columns:
+                new_col = f"{c}_Z"
+                df_period[new_col] = robust_zscore(df_period[c])
+                w_keys[new_col] = weights_config.get(c, 0.0)
+                    
+        ranked_period = build_composite_score(df_period, w_keys)
+        current_weights = construct_portfolio(ranked_period, risk_window, top_n, 0.15 if use_vol_target else None)
+        
+        # --- CÁLCULO DE RETORNO DO PERÍODO ---
+        market_period = subset_prices.loc[rebal_date:next_date].iloc[1:] 
+        period_pct = market_period.pct_change().dropna()
+        if period_pct.empty: continue
             
-    if history:
-        full_ret = pd.concat(history)
-        full_ret = full_ret[~full_ret.index.duplicated()]
-        return (1 + full_ret).cumprod()
-    
+        valid_tickers = [t for t in current_weights.index if t in period_pct.columns]
+        if valid_tickers:
+            strat_ret = period_pct[valid_tickers].dot(current_weights[valid_tickers])
+        else:
+            strat_ret = pd.Series(0.0, index=period_pct.index)
+            
+        if 'BOVA11.SA' in period_pct.columns:
+            bench_ret = period_pct['BOVA11.SA']
+        else:
+            bench_ret = pd.Series(0.0, index=period_pct.index)
+            
+        strategy_daily_rets.append(strat_ret)
+        benchmark_daily_rets.append(bench_ret)
+        
+    if strategy_daily_rets:
+        full_strategy = pd.concat(strategy_daily_rets)
+        full_benchmark = pd.concat(benchmark_daily_rets)
+        # Remove duplicatas de index (dias de rebalanceamento podem sobrepor)
+        full_strategy = full_strategy[~full_strategy.index.duplicated(keep='first')]
+        full_benchmark = full_benchmark[~full_benchmark.index.duplicated(keep='first')]
+        
+        cumulative = pd.DataFrame({
+            'Strategy': (1 + full_strategy).cumprod(),
+            'BOVA11.SA': (1 + full_benchmark).cumprod()
+        })
+        return cumulative.dropna()
     return pd.DataFrame()
+
 # ==============================================================================
-# 5. APP PRINCIPAL
+# APP PRINCIPAL (STREAMLIT UI)
 # ==============================================================================
 
 def main():
-    col_logo, col_title = st.columns([1, 5])
-    with col_logo:
-        st.write("## 🦁") # Placeholder logo SPX/Fundo
-    with col_title:
-        st.title("Quant Factor Lab | Multi-Strategy Engine")
-        st.markdown("**Investment Grade Decision Support System**")
+    st.title("🧪 Quant Factor Lab: Fundamentus Edition")
+    st.markdown("""
+    **Engine Otimizada:** Integração com biblioteca `fundamentus` e correção de Look-ahead Bias para Valuation.
+    *Nota: Backtests históricos usam reconstrução de múltiplos baseada em preços históricos e LPA/VPA atuais.*
+    """)
 
-    # --- SIDEBAR ---
-    st.sidebar.header("🛠️ Configuração do Universo")
+    st.sidebar.header("1. Universo e Dados")
+    default_univ = "ITUB4, VALE3, WEGE3, PETR4, BBAS3, JBSS3, ELET3, RENT3, SUZB3, GGBR4, RAIL3, BPAC11, PRIO3, VBBR3, HYPE3, RADL3, B3SA3, CMIG4, TOTS3, VIVT3"
+    st.sidebar.caption("Use códigos sem .SA (padrão Fundamentus) ou com .SA")
+    ticker_input = st.sidebar.text_area("Tickers", default_univ, height=100)
     
-    # Input melhorado
-    default_univ = "WEGE3.SA, ITUB4.SA, VALE3.SA, PETR4.SA, PRIO3.SA, BBAS3.SA, RENT3.SA, LREN3.SA, ELET3.SA, GGBR4.SA, CSAN3.SA, B3SA3.SA, SUZB3.SA, EQTL3.SA, RADL3.SA, RDOR3.SA, VIBRA3.SA, JBSS3.SA, CPFE3.SA, EMBR3.SA"
-    ticker_input = st.sidebar.text_area("Tickers (IBOV / Small Caps)", default_univ, height=150)
-    tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
+    # Tratamento de input para garantir compatibilidade
+    raw_tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
+    # Para o Fundamentus, removemos .SA para conferência
+    fundamentus_tickers = [t.replace('.SA', '') for t in raw_tickers]
+    # Para o Yahoo Finance (preços), precisamos do .SA
+    yfinance_tickers = [f"{t}.SA" if not t.endswith('.SA') else t for t in fundamentus_tickers]
 
-    st.sidebar.markdown("---")
-    st.sidebar.header("⚖️ Pesos do Modelo (Alpha)")
-    w_rm = st.sidebar.slider("Residual Momentum", 0.0, 1.0, 0.4, help="Força da tendência descontada do mercado")
-    w_fm = st.sidebar.slider("Fundamental Growth", 0.0, 1.0, 0.2, help="Crescimento de Receita e Lucros")
-    w_val = st.sidebar.slider("Value (EV/EBITDA)", 0.0, 1.0, 0.2, help="Preço justo vs Geração de caixa")
-    w_qual = st.sidebar.slider("Quality (Accruals)", 0.0, 1.0, 0.2, help="ROE alto e baixa manipulação contábil")
+    st.sidebar.header("2. Pesos dos Fatores")
+    w_rm = st.sidebar.slider("Residual Momentum", 0.0, 1.0, 0.40)
+    w_fm = st.sidebar.slider("Growth (Fundamentus)", 0.0, 1.0, 0.10)
+    w_val = st.sidebar.slider("Value (P/L & P/VP)", 0.0, 1.0, 0.30)
+    w_qual = st.sidebar.slider("Quality (ROE & Margem)", 0.0, 1.0, 0.20)
 
-    run_btn = st.sidebar.button("🚀 Executar Pipeline Quant", type="primary")
+    st.sidebar.header("3. Configurações")
+    top_n = st.sidebar.number_input("Top N Ativos", 1, 20, 5)
+    use_vol_target = st.sidebar.checkbox("Vol Target (Risk Parity)", True)
+    
+    run_btn = st.sidebar.button("🚀 Rodar Análise", type="primary")
 
     if run_btn:
-        with st.status("Processando Dados Institucionais...", expanded=True) as status:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=365*4) # 4 anos de histórico
+        if not raw_tickers:
+            st.error("Insira pelo menos um ticker.")
+            return
 
-            # 1. Fetching
-            st.write("📡 Baixando Preços (Yahoo Finance)...")
-            prices = fetch_price_data(tickers, start_date, end_date)
+        with st.status("Executando Pipeline Quant...", expanded=True) as status:
+            end_date = datetime.now()
+            start_date_total = end_date - timedelta(days=365 * 4) 
+            start_date_backtest = end_date - timedelta(days=365 * 2) # Backtest de 2 anos para ex
+
+            # 1. Busca Preços (Yahoo Finance - melhor para histórico)
+            st.write("Baixando preços históricos...")
+            prices = fetch_price_data(yfinance_tickers, start_date_total, end_date)
             
-            st.write("📊 Baixando e Processando Fundamentos (Paralelo)...")
-            fundamentals = fetch_fundamentals_parallel(tickers)
+            # 2. Busca Fundamentos (Fundamentus - melhor para dados BR atuais)
+            st.write("Conectando API Fundamentus...")
+            fundamentals = fetch_fundamentals_fundamentus(fundamentus_tickers)
             
             if prices.empty or fundamentals.empty:
-                st.error("Falha na obtenção de dados.")
+                st.error("Dados insuficientes. Verifique os tickers.")
+                status.update(label="Erro!", state="error")
                 return
+            
+            # Filtra apenas tickers que temos preço E fundamento
+            common_tickers = list(set(prices.columns) & set(fundamentals.index))
+            if not common_tickers:
+                st.error("Sem interseção entre dados de preço e fundamentos.")
+                st.stop()
+                
+            prices = prices[common_tickers + ['BOVA11.SA']] if 'BOVA11.SA' in prices.columns else prices[common_tickers]
+            fundamentals = fundamentals.loc[common_tickers]
 
-            # 2. Factor Calculation
-            st.write("🧮 Calculando Fatores e Z-Scores...")
+            # 3. Cálculo de Scores Atuais (Snapshot para Ranking de Hoje)
             res_mom = compute_residual_momentum(prices)
-            fund_factors = compute_fundamental_factors(fundamentals)
-            
-            # Merge de todos os fatores
-            df_master = fund_factors.copy()
+            fund_mom = compute_fundamental_momentum(fundamentals)
+            val_score = compute_value_score(fundamentals)
+            qual_score = compute_quality_score(fundamentals)
+
+            df_master = pd.DataFrame(index=common_tickers)
             df_master['Res_Mom'] = res_mom
-            
-            # Adicionar Setor
-            if 'sector' in fundamentals.columns: df_master['Sector'] = fundamentals['sector']
-            
-            df_master.dropna(thresh=3, inplace=True) # Exige min de dados
+            df_master['Fund_Mom'] = fund_mom
+            df_master['Value'] = val_score
+            df_master['Quality'] = qual_score
+            df_master.dropna(thresh=2, inplace=True)
 
-            # 3. Normalização e Scoring
-            # Z-Score Robusto por fator
-            factors = ['Res_Mom', 'Fund_Mom', 'Value_Score', 'Quality_Score']
-            w_map = {'Res_Mom': w_rm, 'Fund_Mom': w_fm, 'Value_Score': w_val, 'Quality_Score': w_qual}
-            
-            final_scores = pd.DataFrame(index=df_master.index)
-            
-            for f in factors:
-                if f in df_master.columns:
-                    # Neutralidade Setorial (Opcional - aqui simplificado global)
-                    final_scores[f] = robust_zscore(df_master[f])
-            
-            # Weighted Composite Score
-            final_scores['Composite'] = 0
-            for f in factors:
-                if f in final_scores.columns:
-                    final_scores['Composite'] += final_scores[f] * w_map[f]
-            
-            final_scores = final_scores.sort_values('Composite', ascending=False)
-            top_picks = final_scores.head(10)
-            
-            # 4. Alocação HRP nos Top Picks
-            st.write("🛡️ Otimizando Portfólio (HRP Algorithm)...")
-            recent_prices = prices[top_picks.index].tail(126) # 6 meses para covariância
-            hrp_weights = get_hrp_weights(recent_prices)
-            
-            # 5. Backtest Híbrido
-            st.write("⏳ Rodando Backtest Walk-Forward...")
-            # Definimos o universo investível como o Top 50% do ranking atual (filtro de qualidade)
-            quality_universe = final_scores.head(int(len(final_scores)*0.5)).index.tolist()
-            equity_curve = run_honest_backtest(prices, quality_universe)
-            
-            status.update(label="Cálculo Concluído!", state="complete", expanded=False)
+            norm_cols = ['Res_Mom', 'Fund_Mom', 'Value', 'Quality']
+            weights_map = {'Res_Mom': w_rm, 'Fund_Mom': w_fm, 'Value': w_val, 'Quality': w_qual}
+            weights_keys = {}
 
-        # --- DASHBOARD UI ---
+            for c in norm_cols:
+                if c in df_master.columns:
+                    new_col = f"{c}_Z"
+                    df_master[new_col] = robust_zscore(df_master[c])
+                    weights_keys[new_col] = weights_map.get(c, 0.0)
+            
+            final_df = build_composite_score(df_master, weights_keys)
+            weights = construct_portfolio(final_df, prices, top_n, 0.15 if use_vol_target else None)
+            
+            # 4. Backtest Dinâmico (Reconstruindo histórico)
+            st.write("Rodando Backtest Walk-Forward...")
+            backtest_curve = run_dynamic_backtest(
+                prices, fundamentals, weights_map, top_n, use_vol_target, start_date_backtest
+            )
+
+            status.update(label="Concluído!", state="complete", expanded=False)
+
+        # DASHBOARD
+        tab1, tab2, tab3 = st.tabs(["🏆 Ranking Atual (Fundamentus)", "📈 Backtest Dinâmico", "🔍 Dados Brutos"])
         
-        # KPI ROW
-        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-        top_ticker = top_picks.index[0]
-        top_sector = fundamentals.loc[top_ticker, 'sector'] if top_ticker in fundamentals.index else "N/A"
-        
-        kpi1.metric("Top Pick", top_ticker, top_sector)
-        kpi2.metric("Universo Analisado", f"{len(df_master)} Ativos", "Filtrados")
-        
-        if not equity_curve.empty:
-            cum_ret = equity_curve.iloc[-1]
-            cagr = (cum_ret**(252/len(equity_curve)) - 1)
-            vol = equity_curve.pct_change().std() * (252**0.5)
-            sharpe = (cagr - 0.10) / vol
-            
-            kpi3.metric("CAGR Estratégia", f"{cagr['Strategy']:.1%}", f"vs {cagr['BOVA11']:.1%} Bench")
-            kpi4.metric("Sharpe Ratio", f"{sharpe['Strategy']:.2f}", "Risco Ajustado")
-
-        tab1, tab2, tab3 = st.tabs(["🏆 Ranking & Alocação", "🔍 Factor Attribution", "📈 Backtest Técnico"])
-
         with tab1:
-            col_rank, col_alloc = st.columns([1.5, 1])
-            with col_rank:
-                st.subheader("Ranking Multifatorial (Z-Score)")
-                st.dataframe(
-                    final_scores.style.background_gradient(cmap='RdYlGn', subset=['Composite']),
-                    height=500, use_container_width=True
-                )
-            with col_alloc:
-                st.subheader("Sugestão de Alocação (HRP)")
-                if not hrp_weights.empty:
-                    df_w = hrp_weights.to_frame("Peso")
-                    df_w['Valor (R$ 10k)'] = df_w['Peso'] * 10000
-                    st.dataframe(df_w.style.format({'Peso': '{:.1%}', 'Valor (R$ 10k)': 'R${:,.2f}'}))
-                    
-                    fig_pie = px.pie(values=hrp_weights.values, names=hrp_weights.index, hole=0.4, title="Diversificação por Risco (Clusters)")
-                    st.plotly_chart(fig_pie, use_container_width=True)
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                st.subheader("Top Picks (Baseado em Dados de Hoje)")
+                st.dataframe(final_df[['Composite_Score'] + list(weights_keys.keys())].head(top_n).style.background_gradient(cmap='Greens'), height=400, use_container_width=True)
+            with col2:
+                st.subheader("Alocação Sugerida")
+                if not weights.empty:
+                    w_df = weights.to_frame(name="Peso")
+                    w_df["Peso"] = w_df["Peso"].map("{:.2%}".format)
+                    st.table(w_df)
+                    st.plotly_chart(px.pie(values=weights.values, names=weights.index, hole=0.4), use_container_width=True)
 
         with tab2:
-            st.subheader("Por que este ativo foi escolhido?")
-            sel_ticker = st.selectbox("Selecione o Ativo para Inspecionar:", top_picks.index)
-            
-            if sel_ticker:
-                # Dados para gráfico de barras
-                attr_data = final_scores.loc[sel_ticker, factors]
-                fig_attr = px.bar(
-                    x=attr_data.index, 
-                    y=attr_data.values, 
-                    color=attr_data.values,
-                    color_continuous_scale='RdYlGn',
-                    labels={'y': 'Z-Score (Desvios Padrão)', 'x': 'Fator'},
-                    title=f"Decomposição de Alpha: {sel_ticker}"
-                )
-                fig_attr.add_hline(y=0, line_dash="dot", line_color="white")
-                st.plotly_chart(fig_attr, use_container_width=True)
+            st.subheader("Simulação Histórica (Value Dinâmico)")
+            st.info("Este backtest ajusta os múltiplos de valor (P/L, P/VP) usando o preço histórico do dia dividido pelo lucro atual. Isso remove o viés de usar o P/L de hoje para preços passados.")
+            if not backtest_curve.empty:
+                ret_strat = backtest_curve['Strategy'].iloc[-1] - 1
+                ret_bench = backtest_curve['BOVA11.SA'].iloc[-1] - 1
                 
-                # Dados Brutos
-                st.markdown("#### Dados Fundamentais Brutos")
-                raw_data = fundamentals.loc[sel_ticker].to_frame().T
-                st.dataframe(raw_data)
+                c1, c2 = st.columns(2)
+                c1.metric("Retorno Estratégia", f"{ret_strat:.2%}", delta=f"{(ret_strat-ret_bench):.2%}")
+                c2.metric("Retorno BOVA11", f"{ret_bench:.2%}")
+                
+                st.plotly_chart(px.line(backtest_curve, title="Curva de Retorno Acumulado"), use_container_width=True)
+            else:
+                st.warning("Dados insuficientes para o período selecionado.")
 
         with tab3:
-            st.markdown("""
-            > **Nota de Metodologia:** Este backtest evita o *Look-Ahead Bias*. Ele utiliza o universo de ativos filtrado pela 
-            > qualidade atual, mas aplica historicamente apenas sinais de **Preço (Momentum)** e **Risco (HRP)**. 
-            > Isso simula uma estratégia de "Trend Following em empresas de Qualidade".
-            """)
-            if not equity_curve.empty:
-                st.line_chart(equity_curve)
-                
-                # Drawdown Chart
-                drawdown = equity_curve / equity_curve.cummax() - 1
-                st.area_chart(drawdown['Strategy'], color="#ff4b4b")
-                st.caption("Drawdown Histórico (Queda do Topo)")
-            else:
-                st.warning("Dados insuficientes para backtest robusto.")
+            st.dataframe(fundamentals)
 
 if __name__ == "__main__":
     main()
