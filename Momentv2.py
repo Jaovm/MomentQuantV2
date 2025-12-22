@@ -66,50 +66,51 @@ def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFr
 
 @st.cache_data(ttl=3600*24)
 def fetch_fundamentals_fundamentus(tickers: list) -> pd.DataFrame:
-    """
-    Busca snapshots fundamentais usando a biblioteca 'fundamentus'.
-    Retorna dataframe com colunas padronizadas.
-    """
     try:
-        # Busca dados brutos (retorna todos os papéis disponíveis na bolsa)
         df_raw = fundamentus.get_resultado()
         
-        # Limpa tickers de entrada (remove .SA para bater com o index do fundamentus)
-        clean_tickers_input = [t.replace('.SA', '') for t in tickers]
+        # Padronização: Removemos pontos e espaços dos nomes das colunas para facilitar a busca
+        df_raw.columns = [c.strip().lower().replace('.', '').replace(' ', '_') for c in df_raw.columns]
         
-        # Filtra apenas os tickers solicitados que existem na base
+        clean_tickers_input = [t.replace('.SA', '') for t in tickers]
         valid_tickers = [t for t in clean_tickers_input if t in df_raw.index]
         
         if not valid_tickers:
             return pd.DataFrame()
 
         df = df_raw.loc[valid_tickers].copy()
+        df_final = pd.DataFrame(index=df.index)
         
-        # Mapeamento e conversão de colunas
-        df_final = pd.DataFrame()
-        df_final['sector'] = 'Unknown' 
-        
-        # Valuation (Fundamentus retorna strings ou floats, garantimos float)
-        df_final['pl'] = pd.to_numeric(df['pl'], errors='coerce')
-        df_final['pvp'] = pd.to_numeric(df['pvp'], errors='coerce')
-        df_final['evebitda'] = pd.to_numeric(df['evebitda'], errors='coerce')
-        
-        # Qualidade / Rentabilidade
-        df_final['roe'] = pd.to_numeric(df['roe'], errors='coerce')
-        df_final['mrgebit'] = pd.to_numeric(df['mrgebit'], errors='coerce')
-        df_final['mrgliq'] = pd.to_numeric(df['mrgliq'], errors='coerce')
-        df_final['div_bruta_patrim'] = pd.to_numeric(df['div_bruta/patrim'], errors='coerce')
-        
-        # Crescimento (Revenue Growth 5y)
-        df_final['cresc_rec5'] = pd.to_numeric(df['cres_rec5'], errors='coerce')
+        # Mapeamento Flexível: Tentamos encontrar a coluna por variações de nome
+        def get_col(options):
+            for opt in options:
+                if opt in df.columns: return pd.to_numeric(df[opt], errors='coerce')
+            return np.nan
 
-        # Adicionar o sufixo .SA novamente para compatibilidade com YFinance
-        df_final.index = [f"{x}.SA" for x in df_final.index]
+        # Valuation
+        df_final['pl'] = get_col(['pl'])
+        df_final['pvp'] = get_col(['pvp'])
+        df_final['evebitda'] = get_col(['evebitda'])
         
+        # Qualidade
+        df_final['roe'] = get_col(['roe'])
+        df_final['mrgliq'] = get_col(['mrg_liq', 'marg_liquida', 'mrgliq'])
+        
+        # Alavancagem (Onde estava dando erro)
+        # A lib costuma retornar 'divb/patr' ou 'div_bruta/patrim'
+        df_final['div_bruta_patrim'] = get_col(['div_bruta/patrim', 'divb/patr', 'div_br/patr'])
+        
+        # Crescimento
+        df_final['cresc_rec5'] = get_col(['cres_rec5', 'cresc_rec_5a'])
+
+        # Restaura o sufixo .SA
+        df_final.index = [f"{x}.SA" for x in df_final.index]
         return df_final
 
     except Exception as e:
-        st.error(f"Erro ao buscar dados do Fundamentus: {e}")
+        st.error(f"Erro ao processar colunas do Fundamentus: {e}")
+        # Debug para você ver o que está vindo da API no console
+        if 'df_raw' in locals(): st.write("Colunas disponíveis:", df_raw.columns.tolist())
         return pd.DataFrame()
 
 # ==============================================================================
