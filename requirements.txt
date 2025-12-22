@@ -7,3 +7,4 @@ plotly
 scipy
 pytest
 matplotlib  # <<-- Adicionado
+fundamentus
