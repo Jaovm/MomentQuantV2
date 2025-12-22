@@ -12,7 +12,7 @@ import fundamentus  # pip install fundamentus
 # CONFIGURAÇÃO DA PÁGINA
 # ==============================================================================
 st.set_page_config(
-    page_title="Quant Factor Lab Pro (Fundamentus)",
+    page_title="Quant Factor Lab Pro (Fundamentus + DCA)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -99,7 +99,7 @@ def fetch_fundamentals_fundamentus(tickers: list) -> pd.DataFrame:
 def compute_residual_momentum(price_df: pd.DataFrame, lookback=12, skip=1) -> pd.Series:
     df = price_df.copy()
     monthly = df.resample('ME').last().ffill()
-    rets = monthly.pct_change(fill_method=None).dropna()
+    rets = monthly.pct_change().dropna()
     
     if 'BOVA11.SA' not in rets.columns:
         return pd.Series(dtype=float)
@@ -173,15 +173,6 @@ def build_composite_score(df_master: pd.DataFrame, weights: dict) -> pd.DataFram
             df['Composite_Score'] += df[factor_col].fillna(0) * weight
     return df.sort_values('Composite_Score', ascending=False)
 
-def get_implied_per_share_metrics(prices_current: pd.Series, fundamentals_current: pd.DataFrame) -> pd.DataFrame:
-    metrics = pd.DataFrame(index=fundamentals_current.index)
-    common_idx = prices_current.index.intersection(fundamentals_current.index)
-    p = prices_current[common_idx]
-    f = fundamentals_current.loc[common_idx]
-    metrics.loc[common_idx, 'Implied_EPS'] = np.where(f['pl'] != 0, p / f['pl'], np.nan)
-    metrics.loc[common_idx, 'Implied_BVPS'] = np.where(f['pvp'] != 0, p / f['pvp'], np.nan)
-    return metrics
-
 # ==============================================================================
 # MÓDULO 4: PORTFOLIO & BACKTESTS
 # ==============================================================================
@@ -201,6 +192,7 @@ def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame, top_n: in
         weights = pd.Series(1.0/len(selected), index=selected)
     return weights.sort_values(ascending=False)
 
+# Backtest tradicional (rebalance mensal com valorização, sem aportes novos)
 def run_dynamic_backtest(
     all_prices: pd.DataFrame, 
     all_fundamentals_snapshot: pd.DataFrame, 
@@ -209,12 +201,106 @@ def run_dynamic_backtest(
     use_vol_target: bool,
     start_date_backtest: datetime
 ):
-    # (mantido igual ao anterior - omitido por brevidade, mas está presente no código completo)
-    # ... [código anterior do backtest rebalance mensal sem DCA]
-    # (para evitar repetição, mantido como estava)
+    end_date = all_prices.index[-1]
+    last_prices = all_prices.iloc[-1]
+    implied_metrics = get_implied_per_share_metrics(last_prices, all_fundamentals_snapshot)
+    
+    subset_prices = all_prices.loc[start_date_backtest - timedelta(days=400):end_date]
+    rebalance_dates = subset_prices.loc[start_date_backtest:end_date].resample('MS').first().index.tolist()
+    
+    if not rebalance_dates:
+        return pd.DataFrame()
 
-    # Nota: o backtest original foi mantido inalterado
+    strategy_daily_rets = []
+    benchmark_daily_rets = []
 
+    for i, rebal_date in enumerate(rebalance_dates):
+        next_date = rebalance_dates[i+1] if i < len(rebalance_dates)-1 else end_date
+        
+        prices_historical = subset_prices.loc[:rebal_date]
+        if prices_historical.empty:
+            continue
+        
+        current_prices_at_rebal = prices_historical.iloc[-1]
+        
+        mom_window = prices_historical.tail(400)
+        risk_window = prices_historical.tail(90)
+        res_mom = compute_residual_momentum(mom_window)
+        
+        df_period = pd.DataFrame(index=all_prices.columns.drop('BOVA11.SA', errors='ignore'))
+        df_calc = df_period.join(implied_metrics)
+        df_calc['Price_Rebal'] = current_prices_at_rebal
+        df_calc = df_calc.fillna(0)
+        
+        eps = df_calc['Implied_EPS'].replace(0, np.nan)
+        bvps = df_calc['Implied_BVPS'].replace(0, np.nan)
+        
+        pl_est = df_calc['Price_Rebal'] / eps
+        pvp_est = df_calc['Price_Rebal'] / bvps
+        
+        s_ep = np.where((pl_est > 0) & (pl_est < 300), 1/pl_est, 0)
+        s_bp = np.where((pvp_est > 0) & (pvp_est < 50), 1/pvp_est, 0)
+        
+        val_score = (pd.Series(s_ep, index=df_period.index) + pd.Series(s_bp, index=df_period.index)) / 2
+        
+        fund_mom = compute_fundamental_momentum(all_fundamentals_snapshot)
+        qual_score = compute_quality_score(all_fundamentals_snapshot)
+        
+        df_period['Res_Mom'] = res_mom
+        df_period['Fund_Mom'] = fund_mom
+        df_period['Value'] = val_score
+        df_period['Quality'] = qual_score
+        df_period.dropna(thresh=2, inplace=True)
+        
+        w_keys = {}
+        for c in ['Res_Mom', 'Fund_Mom', 'Value', 'Quality']:
+            if c in df_period.columns:
+                new_col = f"{c}_Z"
+                df_period[new_col] = robust_zscore(df_period[c])
+                w_keys[new_col] = weights_config.get(c, 0.0)
+                    
+        ranked_period = build_composite_score(df_period, w_keys)
+        current_weights = construct_portfolio(ranked_period, risk_window, top_n, 0.15 if use_vol_target else None)
+        
+        market_period = subset_prices.loc[rebal_date:next_date].iloc[1:]
+        period_pct = market_period.pct_change().dropna()
+        if period_pct.empty:
+            continue
+            
+        valid_tickers = [t for t in current_weights.index if t in period_pct.columns]
+        if valid_tickers:
+            strat_ret = period_pct[valid_tickers].dot(current_weights[valid_tickers])
+        else:
+            strat_ret = pd.Series(0.0, index=period_pct.index)
+            
+        bench_ret = period_pct['BOVA11.SA'] if 'BOVA11.SA' in period_pct.columns else pd.Series(0.0, index=period_pct.index)
+            
+        strategy_daily_rets.append(strat_ret)
+        benchmark_daily_rets.append(bench_ret)
+        
+    if strategy_daily_rets:
+        full_strategy = pd.concat(strategy_daily_rets)
+        full_benchmark = pd.concat(benchmark_daily_rets)
+        full_strategy = full_strategy[~full_strategy.index.duplicated(keep='first')]
+        full_benchmark = full_benchmark[~full_benchmark.index.duplicated(keep='first')]
+        
+        cumulative = pd.DataFrame({
+            'Strategy': (1 + full_strategy).cumprod(),
+            'BOVA11.SA': (1 + full_benchmark).cumprod()
+        })
+        return cumulative.dropna()
+    return pd.DataFrame()
+
+def get_implied_per_share_metrics(prices_current: pd.Series, fundamentals_current: pd.DataFrame) -> pd.DataFrame:
+    metrics = pd.DataFrame(index=fundamentals_current.index)
+    common_idx = prices_current.index.intersection(fundamentals_current.index)
+    p = prices_current[common_idx]
+    f = fundamentals_current.loc[common_idx]
+    metrics.loc[common_idx, 'Implied_EPS'] = np.where(f['pl'] != 0, p / f['pl'], np.nan)
+    metrics.loc[common_idx, 'Implied_BVPS'] = np.where(f['pvp'] != 0, p / f['pvp'], np.nan)
+    return metrics
+
+# Simulação DCA com aportes mensais e acumulação física
 def run_dca_backtest_fundamentus(
     all_prices: pd.DataFrame, 
     all_fundamentals: pd.DataFrame, 
@@ -224,14 +310,13 @@ def run_dca_backtest_fundamentus(
     use_vol_target: bool,
     start_date: datetime
 ):
-    """Simula evolução patrimonial com aportes mensais fixos (DCA)."""
     end_date = all_prices.index[-1]
     dca_dates = all_prices.loc[start_date:end_date].resample('MS').first().index.tolist()
     
     if not dca_dates:
         return pd.DataFrame(), [], {}
 
-    portfolio_holdings = {}  # Ticker: Quantidade acumulada
+    portfolio_holdings = {}  # Ticker: quantidade acumulada
     benchmark_shares = 0.0
     history = []
     
@@ -240,7 +325,7 @@ def run_dca_backtest_fundamentus(
     daily_equity['Bench_Value'] = 0.0
 
     for i, rebal_date in enumerate(dca_dates):
-        # 1. Calcula ranking e pesos para o aporte do mês
+        # Calcula ranking e pesos para o aporte deste mês
         prices_hist = all_prices.loc[:rebal_date].tail(400)
         res_mom = compute_residual_momentum(prices_hist)
         fund_mom = compute_fundamental_momentum(all_fundamentals)
@@ -263,52 +348,57 @@ def run_dca_backtest_fundamentus(
         ranked = build_composite_score(df_step, w_keys)
         weights = construct_portfolio(ranked, prices_hist.tail(90), top_n, 0.15 if use_vol_target else None)
         
-        # 2. Executa aporte
         current_prices = all_prices.loc[rebal_date]
         
-        # Benchmark BOVA11
-        if 'BOVA11.SA' in current_prices and not pd.isna(current_prices['BOVA11.SA']):
+        # Aporte no Benchmark (BOVA11)
+        if 'BOVA11.SA' in current_prices and pd.notna(current_prices['BOVA11.SA']):
             p_bench = current_prices['BOVA11.SA']
             benchmark_shares += dca_amount / p_bench
         
-        # Estratégia
+        # Aporte na Estratégia
         for ticker, weight in weights.items():
-            if ticker in current_prices and not pd.isna(current_prices[ticker]):
+            if ticker in current_prices and pd.notna(current_prices[ticker]):
                 p_strat = current_prices[ticker]
                 buy_qty = (dca_amount * weight) / p_strat
                 portfolio_holdings[ticker] = portfolio_holdings.get(ticker, 0.0) + buy_qty
-                history.append({'Data': rebal_date, 'Ticker': ticker, 'Qtd': buy_qty, 'Preço': p_strat, 'Valor': dca_amount * weight})
+                history.append({
+                    'Data': rebal_date,
+                    'Ticker': ticker.replace('.SA', ''),
+                    'Quantidade': round(buy_qty, 6),
+                    'Preço': round(p_strat, 2),
+                    'Valor Investido (R$)': round(dca_amount * weight, 2)
+                })
 
-        # 3. Atualiza patrimônio diário até próximo aporte
-        next_rebal = dca_dates[i+1] if i < len(dca_dates)-1 else end_date
+        # Atualiza valor diário do patrimônio
+        next_rebal = dca_dates[i+1] if i < len(dca_dates)-1 else end_date + timedelta(days=1)
         period_index = all_prices.loc[rebal_date:next_rebal].index
         
         for d in period_index:
-            val_strat = sum(
-                all_prices.at[d, t] * q for t, q in portfolio_holdings.items()
-                if t in all_prices.columns and not pd.isna(all_prices.at[d, t])
-            )
-            bench_val = all_prices.at[d, 'BOVA11.SA'] * benchmark_shares if 'BOVA11.SA' in all_prices.columns else 0
-            
+            if d > end_date:
+                continue
+            val_strat = 0.0
+            for t, q in portfolio_holdings.items():
+                if t in all_prices.columns and pd.notna(all_prices.at[d, t]):
+                    val_strat += all_prices.at[d, t] * q
             daily_equity.at[d, 'Strategy_Value'] = val_strat
-            daily_equity.at[d, 'Bench_Value'] = bench_val
+            
+            if 'BOVA11.SA' in all_prices.columns and pd.notna(all_prices.at[d, 'BOVA11.SA']):
+                daily_equity.at[d, 'Bench_Value'] = all_prices.at[d, 'BOVA11.SA'] * benchmark_shares
 
-    daily_equity = daily_equity.ffill()  # Garante continuidade
+    daily_equity = daily_equity.ffill().fillna(0)
     return daily_equity, history, portfolio_holdings
 
 # ==============================================================================
-# APP PRINCIPAL (STREAMLIT UI)
+# APP PRINCIPAL
 # ==============================================================================
 
 def main():
     st.title("🧪 Quant Factor Lab: Fundamentus + DCA Edition")
-    st.markdown("""
-    **Multi-Factor + DCA Simulator** – Ranking atual, backtest tradicional e simulação realista de aportes mensais.
-    """)
+    st.markdown("**Multi-Factor Ranking + Backtest + Simulação Realista de Aportes Mensais (DCA)**")
 
-    st.sidebar.header("1. Universo e Dados")
+    st.sidebar.header("1. Universo de Ativos")
     default_univ = "ITUB4, VALE3, WEGE3, PETR4, BBAS3, JBSS3, ELET3, RENT3, SUZB3, GGBR4, RAIL3, BPAC11, PRIO3, VBBR3, HYPE3, RADL3, B3SA3, CMIG4, TOTS3, VIVT3"
-    ticker_input = st.sidebar.text_area("Tickers (Separados por vírgula)", default_univ, height=100)
+    ticker_input = st.sidebar.text_area("Tickers (vírgula)", default_univ, height=120)
     
     raw_tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
     fundamentus_tickers = [t.replace('.SA', '') for t in raw_tickers]
@@ -316,54 +406,56 @@ def main():
 
     st.sidebar.header("2. Pesos dos Fatores")
     w_rm = st.sidebar.slider("Residual Momentum", 0.0, 1.0, 0.40)
-    w_fm = st.sidebar.slider("Growth (Fundamentus)", 0.0, 1.0, 0.10)
-    w_val = st.sidebar.slider("Value (P/L & P/VP)", 0.0, 1.0, 0.30)
-    w_qual = st.sidebar.slider("Quality (ROE & Margem)", 0.0, 1.0, 0.20)
+    w_fm = st.sidebar.slider("Growth (Cresc. Receita 5a)", 0.0, 1.0, 0.10)
+    w_val = st.sidebar.slider("Value (P/L + P/VP)", 0.0, 1.0, 0.30)
+    w_qual = st.sidebar.slider("Quality (ROE + Margem)", 0.0, 1.0, 0.20)
 
-    st.sidebar.header("3. Configurações do Portfólio")
+    st.sidebar.header("3. Configuração do Portfólio")
     top_n = st.sidebar.number_input("Top N Ativos", 1, 20, 5)
-    use_vol_target = st.sidebar.checkbox("Vol Target (Risk Parity)", True)
+    use_vol_target = st.sidebar.checkbox("Risk Parity (Vol Target)", True)
 
     st.sidebar.markdown("---")
-    st.sidebar.header("4. Simulação Mensal (DCA)")
-    dca_amount = st.sidebar.number_input("Aporte Mensal (R$)", min_value=100, max_value=50000, value=1000, step=100)
-    dca_years = st.sidebar.slider("Período de Simulação DCA (anos)", 1, 5, 2)
+    st.sidebar.header("4. Simulação DCA")
+    dca_amount = st.sidebar.number_input("Aporte Mensal (R$)", 100, 20000, 1000, step=100)
+    dca_years = st.sidebar.slider("Período DCA (anos)", 1, 5, 2)
 
-    run_btn = st.sidebar.button("🚀 Rodar Análise", type="primary")
+    run_btn = st.sidebar.button("🚀 Executar Análise Completa", type="primary")
 
     if run_btn:
         if not raw_tickers:
-            st.error("Insira pelo menos um ticker.")
+            st.error("Insira ao menos um ticker.")
             return
 
-        with st.status("Executando Pipeline Quant...", expanded=True) as status:
+        with st.status("Processando dados e simulações...", expanded=True) as status:
             end_date = datetime.now()
-            start_date_total = end_date - timedelta(days=365 * 5)
-            start_date_backtest = end_date - timedelta(days=365 * 2)
-            start_date_dca = end_date - timedelta(days=365 * dca_years)
+            start_date_total = end_date - timedelta(days=365*5)
+            start_date_backtest = end_date - timedelta(days=365*2)
+            start_date_dca = end_date - timedelta(days=365*dca_years)
 
-            st.write("Baixando preços históricos...")
-            prices = fetch_price_data(yfinance_tickers, start_date_total, end_date)
-            
-            st.write("Buscando dados no Fundamentus...")
+            st.write("⬇️ Baixando preços históricos...")
+            prices = fetch_price_data(yfinance_tickers, start_date_total.strftime("%Y-%m-%d"), end_date)
+
+            st.write("⬇️ Buscando fundamentos (Fundamentus)...")
             fundamentals = fetch_fundamentals_fundamentus(fundamentus_tickers)
-            
+
             if prices.empty or fundamentals.empty:
-                st.error("Falha ao obter dados.")
+                st.error("Falha ao obter dados essenciais.")
+                status.update(label="Erro", state="error")
                 return
-            
+
             common_tickers = list(set(prices.columns) & set(fundamentals.index))
             if not common_tickers:
-                st.error("Sem interseção entre preços e fundamentos.")
+                st.error("Nenhum ticker em comum entre preços e fundamentos.")
+                status.update(label="Erro", state="error")
                 return
-                
+
             prices = prices[common_tickers + ['BOVA11.SA']] if 'BOVA11.SA' in prices.columns else prices[common_tickers]
             fundamentals = fundamentals.loc[common_tickers]
 
             weights_map = {'Res_Mom': w_rm, 'Fund_Mom': w_fm, 'Value': w_val, 'Quality': w_qual}
 
-            # Ranking Atual
-            st.write("Calculando ranking atual...")
+            # Ranking atual
+            st.write("🧮 Calculando ranking atual...")
             res_mom = compute_residual_momentum(prices)
             fund_mom = compute_fundamental_momentum(fundamentals)
             val_score = compute_value_score(fundamentals)
@@ -382,78 +474,75 @@ def main():
                     new_col = f"{c}_Z"
                     df_master[new_col] = robust_zscore(df_master[c])
                     weights_keys[new_col] = weights_map.get(c, 0.0)
-            
+
             final_df = build_composite_score(df_master, weights_keys)
             current_weights = construct_portfolio(final_df, prices, top_n, 0.15 if use_vol_target else None)
 
-            # Backtest Tradicional
-            st.write("Executando backtest rebalance...")
-            backtest_curve = run_dynamic_backtest(
-                prices, fundamentals, weights_map, top_n, use_vol_target, start_date_backtest
-            )
+            # Backtest rebalance
+            st.write("📈 Executando backtest rebalance mensal...")
+            backtest_curve = run_dynamic_backtest(prices, fundamentals, weights_map, top_n, use_vol_target, start_date_backtest)
 
             # Simulação DCA
-            st.write("Simulando estratégia com aportes mensais (DCA)...")
+            st.write("💰 Simulando DCA com aportes mensais...")
             dca_curve, dca_history, final_holdings = run_dca_backtest_fundamentus(
                 prices, fundamentals, weights_map, top_n, dca_amount, use_vol_target, start_date_dca
             )
 
-            status.update(label="Concluído!", state="complete", expanded=False)
+            status.update(label="Concluído com sucesso!", state="complete")
 
-        # DASHBOARD COM 4 ABAS
-        tab1, tab2, tab3, tab4 = st.tabs(["🏆 Ranking Atual", "📈 Performance", "💰 Simulação DCA", "💼 Custódia Final"])
-        
+        # Dashboard com 4 abas
+        tab1, tab2, tab3, tab4 = st.tabs(["🏆 Ranking Atual", "📈 Backtest Rebalance", "💰 Simulação DCA", "💼 Custódia Final"])
+
         with tab1:
             col1, col2 = st.columns([2, 1])
             with col1:
-                st.subheader("Melhores Oportunidades (Hoje)")
+                st.subheader("Top Oportunidades Hoje")
                 show_cols = ['Composite_Score'] + list(weights_keys.keys())
-                st.dataframe(final_df[show_cols].head(top_n).style.background_gradient(cmap='Greens'), use_container_width=True)
+                st.dataframe(final_df[show_cols].head(top_n * 2).style.background_gradient(cmap='Greens'), use_container_width=True)
             with col2:
                 st.subheader("Alocação Sugerida")
                 if not current_weights.empty:
-                    w_df = current_weights.to_frame(name="Peso")
-                    w_df["Peso"] = w_df["Peso"].map("{:.2%}".format)
-                    st.table(w_df)
-                    st.plotly_chart(px.pie(values=current_weights.values, names=current_weights.index, hole=0.4), use_container_width=True)
+                    w_df = current_weights.to_frame("Peso (%)")
+                    w_df["Peso (%)"] = (w_df["Peso (%)"] * 100).round(2)
+                    st.dataframe(w_df)
+                    st.plotly_chart(px.pie(values=current_weights.values, names=current_weights.index.str.replace('.SA', ''), hole=0.4), use_container_width=True)
 
         with tab2:
-            st.subheader("Backtest Rebalance Mensal (Sem Aportes)")
+            st.subheader("Backtest Rebalance Mensal (sem aportes adicionais)")
             if not backtest_curve.empty:
+                years = (backtest_curve.index[-1] - backtest_curve.index[0]).days / 365.25
                 ret_strat = backtest_curve['Strategy'].iloc[-1] - 1
                 ret_bench = backtest_curve['BOVA11.SA'].iloc[-1] - 1
-                
-                years = (backtest_curve.index[-1] - backtest_curve.index[0]).days / 365.25
                 cagr_strat = (backtest_curve['Strategy'].iloc[-1]) ** (1/years) - 1
                 
                 rets_daily = backtest_curve.pct_change().dropna()
                 vol_ann = rets_daily['Strategy'].std() * np.sqrt(252)
-                rf_rate = 0.10  # SELIC aproximada
-                sharpe = (cagr_strat - rf_rate) / vol_ann if vol_ann > 0 else 0
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Retorno Total Estratégia", f"{ret_strat:.2%}")
+                sharpe = (cagr_strat - 0.10) / vol_ann if vol_ann > 0 else 0
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Retorno Total", f"{ret_strat:.2%}")
                 c2.metric("vs BOVA11", f"{ret_strat - ret_bench:+.2%}")
-                c3.metric("Sharpe Ratio (est.)", f"{sharpe:.2f}")
-                
-                st.plotly_chart(px.line(backtest_curve, title="Curva de Retorno Acumulado (Rebalance)"), use_container_width=True)
+                c3.metric("CAGR", f"{cagr_strat:.2%}")
+                c4.metric("Sharpe (RF 10%)", f"{sharpe:.2f}")
+
+                st.plotly_chart(px.line(backtest_curve, title="Curva de Capital (Rebalance Mensal)"), use_container_width=True)
             else:
                 st.warning("Dados insuficientes para backtest.")
 
         with tab3:
-            st.subheader(f"Simulação DCA: R$ {dca_amount:,.0f} mensais por {dca_years} ano(s)")
+            st.subheader(f"Simulação DCA: R$ {dca_amount:,.0f} por mês durante {dca_years} ano(s)")
             if not dca_curve.empty:
-                total_invested = dca_amount * len(dca_curve.resample('MS').first())
-                final_value_strat = dca_curve['Strategy_Value'].iloc[-1]
-                final_value_bench = dca_curve['Bench_Value'].iloc[-1]
-                
+                total_aportado = dca_amount * len(dca_curve.resample('MS').first())
+                final_strat = dca_curve['Strategy_Value'].iloc[-1]
+                final_bench = dca_curve['Bench_Value'].iloc[-1]
+
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Patrimônio Final Estratégia", f"R$ {final_value_strat:,.0f}")
-                c2.metric("Patrimônio Final BOVA11", f"R$ {final_value_bench:,.0f}")
-                c3.metric("Total Aportado", f"R$ {total_invested:,.0f}")
-                
+                c1.metric("Patrimônio Estratégia", f"R$ {final_strat:,.0f}")
+                c2.metric("Patrimônio BOVA11", f"R$ {final_bench:,.0f}")
+                c3.metric("Total Aportado", f"R$ {total_aportado:,.0f}")
+
                 fig = px.line(dca_curve, title="Evolução do Patrimônio com Aportes Mensais")
-                fig.update_layout(yaxis_title="Patrimônio (R$)", xaxis_title="Data")
+                fig.update_layout(yaxis_title="Patrimônio (R$)")
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.warning("Sem dados para simulação DCA.")
@@ -462,29 +551,27 @@ def main():
             st.subheader("Custódia Final Acumulada (DCA)")
             if final_holdings:
                 last_prices = prices.iloc[-1]
-                data_alloc = []
+                alloc_data = []
                 for t, q in final_holdings.items():
-                    if t in last_prices and not pd.isna(last_prices[t]):
+                    if t in last_prices and pd.notna(last_prices[t]):
                         val = q * last_prices[t]
-                        data_alloc.append({'Ativo': t.replace('.SA', ''), 'Qtd Acumulada': round(q, 4), 'Valor Atual (R$)': val})
-                
-                df_alloc = pd.DataFrame(data_alloc)
-                df_alloc['Peso %'] = (df_alloc['Valor Atual (R$)'] / df_alloc['Valor Atual (R$)'].sum()) * 100
-                df_alloc = df_alloc.sort_values('Valor Atual (R$)', ascending=False)
-                
-                total_pat = df_alloc['Valor Atual (R$)'].sum()
-                st.write(f"**Patrimônio Total Estimado: R$ {total_pat:,.0f}**")
-                
+                        alloc_data.append({
+                            'Ativo': t.replace('.SA', ''),
+                            'Qtd Acumulada': round(q, 4),
+                            'Valor Atual (R$)': round(val, 2)
+                        })
+                df_alloc = pd.DataFrame(alloc_data).sort_values('Valor Atual (R$)', ascending=False)
+                df_alloc['Peso %'] = (df_alloc['Valor Atual (R$)'] / df_alloc['Valor Atual (R$)'].sum() * 100).round(2)
+                total = df_alloc['Valor Atual (R$)'].sum()
+
+                st.write(f"**Patrimônio Total Estimado: R$ {total:,.0f}**")
                 c1, c2 = st.columns([1.5, 1])
                 with c1:
-                    st.dataframe(
-                        df_alloc.style.format({
-                            'Valor Atual (R$)': 'R$ {:,.2f}',
-                            'Peso %': '{:.2f}%',
-                            'Qtd Acumulada': '{:,.4f}'
-                        }),
-                        use_container_width=True
-                    )
+                    st.dataframe(df_alloc.style.format({
+                        'Valor Atual (R$)': 'R$ {:,.2f}',
+                        'Peso %': '{:.2f}%',
+                        'Qtd Acumulada': '{:,.4f}'
+                    }), use_container_width=True)
                 with c2:
                     st.plotly_chart(px.pie(df_alloc, values='Valor Atual (R$)', names='Ativo', hole=0.5, title="Alocação Final"), use_container_width=True)
             else:
