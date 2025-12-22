@@ -25,7 +25,7 @@ def get_b3_tickers():
         'VALE3.SA', 'PETR4.SA', 'ITUB4.SA', 'BBDC4.SA', 'PETR3.SA',
         'ABEV3.SA', 'WEGE3.SA', 'BBAS3.SA', 'ITSA4.SA', 'RENT3.SA',
         'BPAC11.SA', 'SUZB3.SA', 'HAPV3.SA', 'EQTL3.SA', 'RADL3.SA',
-        'RDOR3.SA', 'PRIO3.SA', 'RAIL3.SA', 'GGBR4.SA', 'JBSS3.SA'
+        'RDOR3.SA', 'PRIO3.SA', 'RAIL3.SA', 'GGBR4.SA'
     ]
 
 # ==========================================
