@@ -21,10 +21,10 @@ st.set_page_config(
 
 @st.cache_data(ttl=3600*12)
 def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFrame:
-    """Busca histórico de preços ajustados, incluindo BOVA11.SA como benchmark."""
+    """Busca histórico de preços ajustados, incluindo DIVO11.SA como benchmark."""
     t_list = list(set(tickers))  # Remove duplicatas
-    if 'BOVA11.SA' not in t_list:
-        t_list.append('BOVA11.SA')
+    if 'DIVO11.SA' not in t_list:
+        t_list.append('DIVO11.SA')
     
     try:
         data = yf.download(
@@ -50,7 +50,7 @@ def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFr
 def fetch_fundamentals(tickers: list) -> pd.DataFrame:
     """Busca snapshot fundamental atual."""
     data = []
-    clean_tickers = [t for t in tickers if t != 'BOVA11.SA']
+    clean_tickers = [t for t in tickers if t != 'DIVO11.SA']
     
     progress_bar = st.progress(0)
     total = len(clean_tickers)
@@ -89,20 +89,20 @@ def fetch_fundamentals(tickers: list) -> pd.DataFrame:
 # ==============================================================================
 
 def compute_residual_momentum(price_df: pd.DataFrame, lookback=12, skip=1) -> pd.Series:
-    """Residual Momentum (Alpha) vs BOVA11.SA."""
+    """Residual Momentum (Alpha) vs DIVO11.SA."""
     df = price_df.copy()
     monthly = df.resample('ME').last()
     rets = monthly.pct_change().dropna()
     
-    if 'BOVA11.SA' not in rets.columns:
+    if 'DIVO11.SA' not in rets.columns:
         return pd.Series(dtype=float)
         
-    market = rets['BOVA11.SA']
+    market = rets['DIVO11.SA']
     scores = {}
     window = lookback + skip
     
     for ticker in rets.columns:
-        if ticker == 'BOVA11.SA':
+        if ticker == 'DIVO11.SA':
             continue
         
         y = rets[ticker].tail(window)
@@ -220,7 +220,7 @@ def run_dynamic_backtest(all_prices, all_fundamentals, weights_config, top_n, us
         val_score = compute_value_score(fundamentals_at_rebal)
         qual_score = compute_quality_score(fundamentals_at_rebal)
         
-        df_period = pd.DataFrame(index=[c for c in all_prices.columns if c != 'BOVA11.SA'])
+        df_period = pd.DataFrame(index=[c for c in all_prices.columns if c != 'DIVO11.SA'])
         df_period['Res_Mom'] = res_mom
         df_period['Fund_Mom'] = fund_mom
         df_period['Value'] = val_score
@@ -258,7 +258,7 @@ def run_dynamic_backtest(all_prices, all_fundamentals, weights_config, top_n, us
             
         strategy_rets = (period_pct[current_weights.index] * current_weights).sum(axis=1)
         strategy_daily_rets.append(strategy_rets)
-        benchmark_daily_rets.append(period_pct['BOVA11.SA'])
+        benchmark_daily_rets.append(period_pct['DIVO11.SA'])
 
     if not strategy_daily_rets:
         return pd.DataFrame()
@@ -268,7 +268,7 @@ def run_dynamic_backtest(all_prices, all_fundamentals, weights_config, top_n, us
     
     df_backtest = pd.DataFrame({
         'Strategy': (1 + strategy_rets_series).cumprod(),
-        'BOVA11.SA': (1 + benchmark_rets_series).cumprod()
+        'DIVO11.SA': (1 + benchmark_rets_series).cumprod()
     })
     
     return df_backtest
@@ -301,7 +301,7 @@ def run_dca_backtest(all_prices, all_fundamentals, weights_config, top_n, dca_am
         val_score = compute_value_score(fundamentals_at_rebal)
         qual_score = compute_quality_score(fundamentals_at_rebal)
         
-        df_period = pd.DataFrame(index=[c for c in all_prices.columns if c != 'BOVA11.SA'])
+        df_period = pd.DataFrame(index=[c for c in all_prices.columns if c != 'DIVO11.SA'])
         df_period['Res_Mom'] = res_mom
         df_period['Fund_Mom'] = fund_mom
         df_period['Value'] = val_score
@@ -338,7 +338,7 @@ def run_dca_backtest(all_prices, all_fundamentals, weights_config, top_n, dca_am
         total_value += dca_amount
         
         # === Aporte no benchmark ===
-        bench_price = current_prices.get('BOVA11.SA', np.nan)
+        bench_price = current_prices.get('DIVO11.SA', np.nan)
         if not np.isnan(bench_price) and bench_price > 0:
             benchmark_units += dca_amount / bench_price
         
@@ -374,11 +374,11 @@ def run_dca_backtest(all_prices, all_fundamentals, weights_config, top_n, dca_am
                 break
             prices_date = subset_prices.loc[date]
             strat_val = sum(holdings.get(t, 0) * prices_date.get(t, 0) for t in holdings.keys())
-            bench_val = benchmark_units * prices_date.get('BOVA11.SA', 0)
+            bench_val = benchmark_units * prices_date.get('DIVO11.SA', 0)
             portfolio_values.append({
                 'Date': date,
                 'Strategy_DCA': strat_val + cash,
-                'BOVA11.SA_DCA': bench_val
+                'DIVO11.SA_DCA': bench_val
             })
     
     df_curve = pd.DataFrame(portfolio_values).set_index('Date').drop_duplicates()
@@ -455,7 +455,7 @@ def main():
             val_score = compute_value_score(fundamentals_snapshot)
             qual_score = compute_quality_score(fundamentals_snapshot)
 
-            final_df = pd.DataFrame(index=[c for c in prices.columns if c != 'BOVA11.SA'])
+            final_df = pd.DataFrame(index=[c for c in prices.columns if c != 'DIVO11.SA'])
             final_df['Res_Mom'] = res_mom
             final_df['Fund_Mom'] = fund_mom
             final_df['Value'] = val_score
@@ -507,3 +507,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
