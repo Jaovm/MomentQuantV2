@@ -301,33 +301,28 @@ def get_implied_per_share_metrics(prices_current: pd.Series, fundamentals_curren
     return metrics
 
 # Simulação DCA com aportes mensais e acumulação física
-def run_dca_backtest_fundamentus(
-    all_prices: pd.DataFrame, 
-    all_fundamentals: pd.DataFrame, 
-    weights_config: dict, 
-    top_n: int, 
-    dca_amount: float, 
-    use_vol_target: bool,
-    start_date: datetime
-):
+def run_dca_backtest_fundamentus(all_prices, all_fundamentals, weights_config, top_n, dca_amount, use_vol_target, start_date):
     end_date = all_prices.index[-1]
+    # Gera datas de aporte mensais
     dca_dates = all_prices.loc[start_date:end_date].resample('MS').first().index.tolist()
     
     if not dca_dates:
         return pd.DataFrame(), [], {}
 
-    portfolio_holdings = {}  # Ticker: quantidade acumulada
+    portfolio_holdings = {} 
     benchmark_shares = 0.0
-    history = []
-    
     daily_equity = pd.DataFrame(index=all_prices.loc[start_date:end_date].index)
     daily_equity['Strategy_Value'] = 0.0
     daily_equity['Bench_Value'] = 0.0
+    history = []
 
     for i, rebal_date in enumerate(dca_dates):
-        # Calcula ranking e pesos para o aporte deste mês
-        prices_hist = all_prices.loc[:rebal_date].tail(400)
-        res_mom = compute_residual_momentum(prices_hist)
+        # Filtra histórico até a data de rebalanceamento para evitar look-ahead bias
+        prices_hist = all_prices.loc[:rebal_date]
+        if prices_hist.empty: continue
+        
+        # Cálculo de fatores... (mantenha sua lógica de pesos aqui)
+        res_mom = compute_residual_momentum(prices_hist.tail(400))
         fund_mom = compute_fundamental_momentum(all_fundamentals)
         val_score = compute_value_score(all_fundamentals)
         qual_score = compute_quality_score(all_fundamentals)
@@ -339,55 +334,39 @@ def run_dca_backtest_fundamentus(
         df_step['Quality'] = qual_score
         df_step.dropna(thresh=2, inplace=True)
         
-        w_keys = {}
+        # Pesos
+        w_keys = {f"{c}_Z": weights_config.get(c, 0.0) for c in ['Res_Mom', 'Fund_Mom', 'Value', 'Quality']}
         for c in ['Res_Mom', 'Fund_Mom', 'Value', 'Quality']:
-            if c in df_step.columns:
-                df_step[f"{c}_Z"] = robust_zscore(df_step[c])
-                w_keys[f"{c}_Z"] = weights_config.get(c, 0.0)
-        
+            df_step[f"{c}_Z"] = robust_zscore(df_step[c])
+            
         ranked = build_composite_score(df_step, w_keys)
         weights = construct_portfolio(ranked, prices_hist.tail(90), top_n, 0.15 if use_vol_target else None)
         
-        current_prices = all_prices.loc[rebal_date]
+        # PEGA PREÇOS ATUAIS (CORRIGIDO PARA EVITAR KEYERROR)
+        current_prices = all_prices.loc[:rebal_date].iloc[-1]
         
-        # Aporte no Benchmark (BOVA11)
-        if 'BOVA11.SA' in current_prices and pd.notna(current_prices['BOVA11.SA']):
-            p_bench = current_prices['BOVA11.SA']
-            benchmark_shares += dca_amount / p_bench
-        
+        # Aporte no Benchmark
+        if 'BOVA11.SA' in current_prices:
+            benchmark_shares += dca_amount / current_prices['BOVA11.SA']
+            
         # Aporte na Estratégia
         for ticker, weight in weights.items():
             if ticker in current_prices and pd.notna(current_prices[ticker]):
                 p_strat = current_prices[ticker]
                 buy_qty = (dca_amount * weight) / p_strat
                 portfolio_holdings[ticker] = portfolio_holdings.get(ticker, 0.0) + buy_qty
-                history.append({
-                    'Data': rebal_date,
-                    'Ticker': ticker.replace('.SA', ''),
-                    'Quantidade': round(buy_qty, 6),
-                    'Preço': round(p_strat, 2),
-                    'Valor Investido (R$)': round(dca_amount * weight, 2)
-                })
+                history.append({'Data': rebal_date, 'Ticker': ticker, 'Qtd': buy_qty, 'Preço': p_strat})
 
-        # Atualiza valor diário do patrimônio
-        next_rebal = dca_dates[i+1] if i < len(dca_dates)-1 else end_date + timedelta(days=1)
-        period_index = all_prices.loc[rebal_date:next_rebal].index
+        # Atualização diária do patrimônio
+        next_rebal = dca_dates[i+1] if i < len(dca_dates)-1 else end_date
+        period_idx = all_prices.loc[rebal_date:next_rebal].index
         
-        for d in period_index:
-            if d > end_date:
-                continue
-            val_strat = 0.0
-            for t, q in portfolio_holdings.items():
-                if t in all_prices.columns and pd.notna(all_prices.at[d, t]):
-                    val_strat += all_prices.at[d, t] * q
+        for d in period_idx:
+            val_strat = sum(all_prices.loc[d, t] * q for t, q in portfolio_holdings.items() if t in all_prices.columns)
             daily_equity.at[d, 'Strategy_Value'] = val_strat
-            
-            if 'BOVA11.SA' in all_prices.columns and pd.notna(all_prices.at[d, 'BOVA11.SA']):
-                daily_equity.at[d, 'Bench_Value'] = all_prices.at[d, 'BOVA11.SA'] * benchmark_shares
+            daily_equity.at[d, 'Bench_Value'] = all_prices.loc[d, 'BOVA11.SA'] * benchmark_shares
 
-    daily_equity = daily_equity.ffill().fillna(0)
     return daily_equity, history, portfolio_holdings
-
 # ==============================================================================
 # APP PRINCIPAL
 # ==============================================================================
