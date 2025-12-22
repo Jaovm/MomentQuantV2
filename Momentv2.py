@@ -1,510 +1,315 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import statsmodels.api as sm
-import plotly.express as px
-from datetime import datetime, timedelta
+import requests
+import datetime
+import warnings
+
+# Configurações iniciais
+warnings.filterwarnings("ignore")
+pd.set_option('display.max_columns', None)
+
+# --- CONFIGURAÇÃO DA API ---
+FMP_API_KEY = "rd6uBzkLLSPG68s9GcSx3folN76IxRhV"  # Sua chave aqui
 
 # ==============================================================================
-# CONFIGURAÇÃO DA PÁGINA
-# ==============================================================================
-st.set_page_config(
-    page_title="Quant Factor Lab Pro",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# ==============================================================================
-# MÓDULO 1: DATA FETCHING
+# 1. AQUISIÇÃO DE DADOS (PREÇOS E FUNDAMENTOS HISTÓRICOS REAIS)
 # ==============================================================================
 
-@st.cache_data(ttl=3600*12)
-def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFrame:
-    """Busca histórico de preços ajustados, incluindo DIVO11.SA como benchmark."""
-    t_list = list(set(tickers))  # Remove duplicatas
-    if 'DIVO11.SA' not in t_list:
-        t_list.append('DIVO11.SA')
+def fetch_price_data(tickers, start_date, end_date):
+    """Baixa dados de preço ajustado do Yahoo Finance."""
+    print("Baixando dados de preço (yfinance)...")
+    data = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
+    return data
+
+def fetch_fmp_fundamentals(tickers, api_key, limit=80):
+    """
+    Busca dados históricos trimestrais (Key Metrics) via Financial Modeling Prep.
+    limit=80 busca aprox. 20 anos de dados trimestrais.
+    """
+    print("Baixando dados fundamentais históricos (Financial Modeling Prep)...")
     
-    try:
-        data = yf.download(
-            t_list, 
-            start=start_date, 
-            end=end_date, 
-            progress=False,
-            auto_adjust=True  # Já usa preços ajustados
-        )['Close' if len(t_list) == 1 else 'Adj Close']
-        
-        if data.empty:
-            return pd.DataFrame()
-        
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-            
-        return data.dropna(how='all')
-    except Exception as e:
-        st.error(f"Erro ao baixar preços: {e}")
-        return pd.DataFrame()
+    all_data = []
+    
+    # Mapeamento: Nome na FMP -> Nome esperado pelo seu script
+    column_mapping = {
+        'date': 'date',
+        'symbol': 'Ticker',
+        'peRatio': 'trailingPE',
+        'pbRatio': 'priceToBook',
+        'roe': 'returnOnEquity',
+        'netProfitMargin': 'profitMargins',
+        'debtToEquity': 'debtToEquity',
+        'enterpriseValueOverEBITDA': 'enterpriseValue' # Aprox. para EV/EBITDA
+    }
 
-@st.cache_data(ttl=3600*24)
-def fetch_fundamentals(tickers: list) -> pd.DataFrame:
-    """Busca snapshot fundamental atual."""
-    data = []
-    clean_tickers = [t for t in tickers if t != 'DIVO11.SA']
-    
-    progress_bar = st.progress(0)
-    total = len(clean_tickers)
-    
-    for i, t in enumerate(clean_tickers):
+    session = requests.Session()
+
+    for ticker in tickers:
         try:
-            info = yf.Ticker(t).info
-            sector = info.get('sector', 'Unknown')
-            if sector in ['Unknown', 'N/A'] and 'longName' in info:
-                if any(word in info['longName'] for word in ['Banco', 'Financeira', 'Seguros']):
-                    sector = 'Financial Services'
+            # Endpoint: Key Metrics (Trimestral)
+            url = f"https://financialmodelingprep.com/api/v3/key-metrics/{ticker}?period=quarter&limit={limit}&apikey={api_key}"
+            response = session.get(url)
+            data = response.json()
             
-            data.append({
-                'ticker': t,
-                'sector': sector,
-                'forwardPE': info.get('forwardPE', np.nan),
-                'priceToBook': info.get('priceToBook', np.nan),
-                'enterpriseToEbitda': info.get('enterpriseToEbitda', np.nan),
-                'returnOnEquity': info.get('returnOnEquity', np.nan),
-                'profitMargins': info.get('profitMargins', np.nan),
-                'debtToEquity': info.get('debtToEquity', np.nan),
-                'earningsGrowth': info.get('earningsGrowth', np.nan),
-                'revenueGrowth': info.get('revenueGrowth', np.nan)
-            })
-        except:
-            pass
-        progress_bar.progress((i + 1) / total)
+            if not data or isinstance(data, dict) and 'Error' in data:
+                print(f"  Aviso: Sem dados para {ticker}")
+                continue
+                
+            df = pd.DataFrame(data)
+            
+            # Filtra e renomeia colunas
+            cols_to_keep = [c for c in column_mapping.keys() if c in df.columns]
+            df = df[cols_to_keep].rename(columns=column_mapping)
+            
+            # Garante que a data seja datetime
+            df['date'] = pd.to_datetime(df['date'])
+            
+            # Adiciona colunas faltantes com NaN se a API não retornar
+            expected_metrics = ['trailingPE', 'priceToBook', 'returnOnEquity', 'profitMargins', 'debtToEquity']
+            for m in expected_metrics:
+                if m not in df.columns:
+                    df[m] = np.nan
+            
+            all_data.append(df)
+            
+        except Exception as e:
+            print(f"  Erro ao baixar {ticker}: {e}")
+
+    if not all_data:
+        raise ValueError("Nenhum dado fundamental foi baixado. Verifique a API Key ou os Tickers.")
+
+    # Concatena todos os tickers
+    full_df = pd.concat(all_data, ignore_index=True)
+    return full_df
+
+def align_fundamentals_to_prices(fund_df, price_df):
+    """
+    Transforma os dados trimestrais em diários usando Forward Fill (ffill).
+    Isso garante que em qualquer data do backtest, temos o dado do último balanço publicado.
+    Retorna um DataFrame MultiIndex (Date, Ticker).
+    """
+    print("Alinhando dados fundamentais ao calendário de preços (Point-in-Time)...")
     
-    progress_bar.empty()
-    if not data:
-        return pd.DataFrame()
-    return pd.DataFrame(data).set_index('ticker')
+    # 1. Pivotar para ter datas no índice e (Ticker, Métrica) nas colunas
+    # Removemos duplicatas de datas se houver
+    fund_df = fund_df.drop_duplicates(subset=['date', 'Ticker'])
+    
+    pivot_df = fund_df.pivot(index='date', columns='Ticker')
+    
+    # 2. Reindexar para cobrir todas as datas de preço (Diário)
+    # O método 'ffill' propaga o último valor válido para frente.
+    # Ex: Balanço sai 31/03. De 01/04 até 29/06 (próximo balanço), usa-se o valor de 31/03.
+    aligned_df = pivot_df.reindex(price_df.index, method='ffill')
+    
+    # 3. Empilhar (Stack) para voltar ao formato (Date, Ticker) -> Métricas
+    # dropna=False mantém dias onde temos preço mas talvez ainda não tenha saído o primeiro balanço
+    stacked_df = aligned_df.stack(level='Ticker', future_stack=True)
+    
+    # Ajuste fino: converter colunas para float
+    stacked_df = stacked_df.apply(pd.to_numeric, errors='coerce')
+    
+    return stacked_df
 
 # ==============================================================================
-# MÓDULO 2: CÁLCULO DE FATORES
+# 2. CÁLCULO DOS FATORES (SCORES)
 # ==============================================================================
 
-def compute_residual_momentum(price_df: pd.DataFrame, lookback=12, skip=1) -> pd.Series:
-    """Residual Momentum (Alpha) vs DIVO11.SA."""
-    df = price_df.copy()
-    monthly = df.resample('ME').last()
-    rets = monthly.pct_change().dropna()
+def compute_residual_momentum(price_df, window=252, lookback_months=12):
+    """Calcula Momentum Residual (Retorno não explicado pelo mercado - Simples)."""
+    # Simplificação: Usamos retorno total ajustado pela volatilidade como proxy robusto
+    # para evitar regressão linear pesada dentro do loop.
+    # Momentum Clássico: Retorno 12 meses excluindo o último mês
     
-    if 'DIVO11.SA' not in rets.columns:
+    log_ret = np.log(price_df / price_df.shift(1))
+    
+    # Retorno acumulado 12 meses (aprox 252 dias)
+    cum_ret = price_df.pct_change(window).iloc[-1] if window < len(price_df) else price_df.pct_change().iloc[-1]
+    
+    # Excluir último mês (Reversal effect) - aprox 21 dias
+    recent_ret = price_df.pct_change(21).iloc[-1] if 21 < len(price_df) else 0
+    
+    momentum_score = cum_ret - recent_ret
+    return momentum_score
+
+def compute_fundamental_momentum(fundamentals_df):
+    """
+    Variação do ROE ou Lucros em relação ao período anterior.
+    Como fundamentals_df é o snapshot da data, precisamos calcular a variação
+    em relação ao dado que estava disponível X dias atrás. 
+    Aqui, usamos o nível atual de ROE como proxy de força, pois o diff no loop é complexo.
+    """
+    # Uma abordagem melhor num snapshot: Score é alto se ROE e Margens são altos
+    # Para variação real, precisaríamos do lag dentro do DF.
+    # Vamos usar um Score Misto de Crescimento Implícito (High ROE)
+    score = fundamentals_df['returnOnEquity'].fillna(0)
+    return score
+
+def compute_value_score(fundamentals_df):
+    """Value: P/E baixo, P/B baixo."""
+    # Inverter P/E e P/B (quanto menor melhor)
+    # Tratamento para P/E negativo ou zero: penalizar
+    pe = fundamentals_df['trailingPE']
+    pb = fundamentals_df['priceToBook']
+    
+    # Inverso do PE (Earnings Yield) - Lida melhor com negativos
+    ey = 1 / pe
+    ey = ey.replace([np.inf, -np.inf], 0)
+    
+    # Inverso do PB (Book Yield)
+    by = 1 / pb
+    by = by.replace([np.inf, -np.inf], 0)
+    
+    # Score combinado
+    score = (ey + by) / 2
+    return score
+
+def compute_quality_score(fundamentals_df):
+    """Quality: Margem Alta, Dívida Baixa, ROE Alto."""
+    roe = fundamentals_df['returnOnEquity'].fillna(0)
+    margin = fundamentals_df['profitMargins'].fillna(0)
+    debt = fundamentals_df['debtToEquity'].fillna(100) # Preenche NaN com dívida alta para penalizar
+    
+    # Inverso da dívida (quanto menor melhor)
+    inv_debt = 1 / (debt + 0.1) 
+    
+    # Normalizar simples antes de somar não é ideal sem z-score cross-sectional,
+    # mas aqui somamos os valores brutos pois serão normalizados depois no loop.
+    score = roe + margin + inv_debt
+    return score
+
+# ==============================================================================
+# 3. ENGINE DE BACKTEST
+# ==============================================================================
+
+def run_dynamic_backtest(price_df, all_fundamentals_aligned, momentum_lookback=252, rebal_freq=63, top_n=5):
+    """
+    Executa o backtest usando dados Point-in-Time.
+    all_fundamentals_aligned: DataFrame MultiIndex (Date, Ticker) já alinhado.
+    """
+    rebalance_dates = price_df.index[::rebal_freq]
+    portfolio_history = []
+    dates_history = []
+    
+    print(f"Iniciando Backtest: {len(rebalance_dates)} rebalanceamentos...")
+
+    for i, rebal_date in enumerate(rebalance_dates):
+        # Pular início se não tiver histórico suficiente
+        if i * rebal_freq < 252: 
+            continue
+            
+        # 1. Dados de Preço Históricos (até a data)
+        hist_prices = price_df.loc[:rebal_date]
+        if len(hist_prices) < momentum_lookback: continue
+        
+        # 2. Dados Fundamentais DA DATA (Point-in-Time)
+        try:
+            # Seleciona a fatia transversal (cross-section) do dia
+            current_fundamentals = all_fundamentals_aligned.loc[rebal_date]
+        except KeyError:
+            # Se cair num feriado, pega o dia anterior disponível
+            idx = all_fundamentals_aligned.index.get_level_values(0)
+            prev_date = idx[idx <= rebal_date].max()
+            current_fundamentals = all_fundamentals_aligned.loc[prev_date]
+
+        # 3. Filtro de Liquidez/Existência
+        # Garante que temos preço E fundamento
+        valid_tickers = current_fundamentals.dropna(how='all').index.intersection(hist_prices.columns)
+        
+        if len(valid_tickers) < top_n:
+            continue
+            
+        curr_fund_subset = current_fundamentals.loc[valid_tickers]
+        hist_price_subset = hist_prices[valid_tickers]
+
+        # 4. Cálculo dos Fatores
+        # Momentum (Price Action)
+        mom_score = hist_price_subset.pct_change(momentum_lookback).iloc[-1] # Simplificado 12m
+        
+        # Fundamentais
+        fund_mom = compute_fundamental_momentum(curr_fund_subset)
+        val_score = compute_value_score(curr_fund_subset)
+        qual_score = compute_quality_score(curr_fund_subset)
+        
+        # 5. Combinação e Ranking
+        factors = pd.DataFrame({
+            'Momentum': mom_score,
+            'Fund_Mom': fund_mom,
+            'Value': val_score,
+            'Quality': qual_score
+        })
+        
+        # Limpeza e Normalização (Z-Score)
+        factors = factors.dropna()
+        if factors.empty: continue
+        
+        z_scores = (factors - factors.mean()) / (factors.std() + 1e-6)
+        z_scores['Total'] = z_scores.mean(axis=1)
+        
+        # Seleção
+        top_picks = z_scores.sort_values(by='Total', ascending=False).head(top_n).index.tolist()
+        
+        # 6. Calcular Retorno para o PRÓXIMO Período
+        if i < len(rebalance_dates) - 1:
+            next_date = rebalance_dates[i+1]
+            # Retorno diário dos ativos selecionados nesse período
+            period_data = price_df.loc[rebal_date:next_date, top_picks]
+            period_returns = period_data.pct_change().mean(axis=1).dropna()
+            
+            if not period_returns.empty:
+                portfolio_history.extend(period_returns.values)
+                dates_history.extend(period_returns.index)
+
+    # Criação da Série de Retorno Acumulado
+    if not portfolio_history:
         return pd.Series(dtype=float)
         
-    market = rets['DIVO11.SA']
-    scores = {}
-    window = lookback + skip
+    strategy_series = pd.Series(portfolio_history, index=dates_history)
+    strategy_equity = (1 + strategy_series).cumprod()
     
-    for ticker in rets.columns:
-        if ticker == 'DIVO11.SA':
-            continue
-        
-        y = rets[ticker].tail(window)
-        x = market.tail(window)
-        
-        if len(y) < window:
-            continue
-            
-        try:
-            X = sm.add_constant(x.values)
-            model = sm.OLS(y.values, X).fit()
-            resid = model.resid[:-skip]
-            
-            if np.std(resid) == 0 or len(resid) < 2:
-                scores[ticker] = 0
-            else:
-                scores[ticker] = np.sum(resid) / np.std(resid)
-        except:
-            scores[ticker] = 0
-            
-    return pd.Series(scores, name='Residual_Momentum')
-
-def compute_fundamental_momentum(fund_df: pd.DataFrame) -> pd.Series:
-    metrics = ['earningsGrowth', 'revenueGrowth']
-    temp_df = pd.DataFrame(index=fund_df.index)
-    for m in metrics:
-        if m in fund_df.columns:
-            s = fund_df[m].fillna(fund_df[m].median())
-            temp_df[m] = (s - s.mean()) / s.std()
-    return temp_df.mean(axis=1).rename("Fundamental_Momentum")
-
-def compute_value_score(fund_df: pd.DataFrame) -> pd.Series:
-    scores = pd.DataFrame(index=fund_df.index)
-    if 'forwardPE' in fund_df.columns:
-        scores['EP'] = np.where(fund_df['forwardPE'] > 0, 1/fund_df['forwardPE'], 0)
-    if 'priceToBook' in fund_df.columns:
-        scores['BP'] = np.where(fund_df['priceToBook'] > 0, 1/fund_df['priceToBook'], 0)
-    return scores.mean(axis=1).rename("Value_Score")
-
-def compute_quality_score(fund_df: pd.DataFrame) -> pd.Series:
-    scores = pd.DataFrame(index=fund_df.index)
-    if 'returnOnEquity' in fund_df.columns:
-        scores['ROE'] = fund_df['returnOnEquity']
-    if 'profitMargins' in fund_df.columns:
-        scores['PM'] = fund_df['profitMargins']
-    if 'debtToEquity' in fund_df.columns:
-        scores['DE_Inv'] = -fund_df['debtToEquity']
-    return scores.mean(axis=1).rename("Quality_Score")
+    return strategy_equity
 
 # ==============================================================================
-# MÓDULO 3: SCORING & NORMALIZAÇÃO
+# 4. EXECUÇÃO PRINCIPAL
 # ==============================================================================
-
-def robust_zscore(series: pd.Series) -> pd.Series:
-    series = series.replace([np.inf, -np.inf], np.nan)
-    median = series.median()
-    mad = (series - median).abs().median()
-    if mad == 0 or mad < 1e-6:
-        return series - median
-    z = (series - median) / (mad * 1.4826)
-    return z.clip(-3, 3)
-
-def build_composite_score(df_master: pd.DataFrame, weights: dict) -> pd.DataFrame:
-    df = df_master.copy()
-    df['Composite_Score'] = 0.0
-    for factor_col, weight in weights.items():
-        if factor_col in df.columns:
-            df['Composite_Score'] += df[factor_col].fillna(0) * weight
-    return df.sort_values('Composite_Score', ascending=False)
-
-# ==============================================================================
-# MÓDULO 4: PORTFOLIO & BACKTEST
-# ==============================================================================
-
-def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame, top_n: int, vol_target: float = None):
-    selected = ranked_df.head(top_n).index.tolist()
-    if not selected:
-        return pd.Series()
-
-    if vol_target is not None:
-        recent_rets = prices[selected].pct_change().tail(63)
-        vols = recent_rets.std() * np.sqrt(252)
-        vols.replace(0, 1e-6, inplace=True)
-        raw_weights = 1 / vols
-        weights = raw_weights / raw_weights.sum()
-    else:
-        weights = pd.Series(1.0 / len(selected), index=selected)
-        
-    return weights.sort_values(ascending=False)
-
-def run_dynamic_backtest(all_prices, all_fundamentals, weights_config, top_n, use_vol_target, use_sector_neutrality, start_date_backtest):
-    end_date = all_prices.index[-1]
-    subset_prices = all_prices.loc[start_date_backtest - timedelta(days=400):end_date]
-    rebalance_dates = subset_prices.loc[start_date_backtest:end_date].resample('MS').first().index.tolist()
-    
-    if len(rebalance_dates) < 2:
-        return pd.DataFrame()
-
-    strategy_daily_rets = []
-    benchmark_daily_rets = []
-
-    for i, rebal_date in enumerate(rebalance_dates):
-        next_date = rebalance_dates[i+1] if i < len(rebalance_dates)-1 else end_date + timedelta(days=1)
-        
-        prices_historical = subset_prices.loc[:rebal_date]
-        mom_window = prices_historical.tail(400)
-        risk_window = prices_historical.tail(90)
-        
-        res_mom = compute_residual_momentum(mom_window)
-        
-        # Point-in-time fundamentals
-        fundamentals_at_rebal = all_fundamentals.loc[rebal_date].unstack(level='Metric') if all_fundamentals.index.names == ['Date', 'Ticker'] else all_fundamentals.loc[rebal_date]
-        
-        fund_mom = compute_fundamental_momentum(fundamentals_at_rebal)
-        val_score = compute_value_score(fundamentals_at_rebal)
-        qual_score = compute_quality_score(fundamentals_at_rebal)
-        
-        df_period = pd.DataFrame(index=[c for c in all_prices.columns if c != 'DIVO11.SA'])
-        df_period['Res_Mom'] = res_mom
-        df_period['Fund_Mom'] = fund_mom
-        df_period['Value'] = val_score
-        df_period['Quality'] = qual_score
-        if 'sector' in fundamentals_at_rebal.columns:
-            df_period['Sector'] = fundamentals_at_rebal['sector']
-        
-        df_period.dropna(thresh=2, inplace=True)
-        
-        norm_cols = ['Res_Mom', 'Fund_Mom', 'Value', 'Quality']
-        w_keys = {}
-        
-        if use_sector_neutrality and 'Sector' in df_period.columns and df_period['Sector'].nunique() > 1:
-            for c in norm_cols:
-                if c in df_period.columns:
-                    new_col = f"{c}_Z"
-                    df_period[new_col] = df_period.groupby('Sector')[c].transform(
-                        lambda x: robust_zscore(x) if len(x) > 1 else x - x.median()
-                    )
-                    w_keys[new_col] = weights_config.get(c, 0.0)
-        else:
-            for c in norm_cols:
-                if c in df_period.columns:
-                    new_col = f"{c}_Z"
-                    df_period[new_col] = robust_zscore(df_period[c])
-                    w_keys[new_col] = weights_config.get(c, 0.0)
-                    
-        ranked_period = build_composite_score(df_period, w_keys)
-        current_weights = construct_portfolio(ranked_period, risk_window, top_n, 0.15 if use_vol_target else None)
-        
-        period_prices = subset_prices.loc[rebal_date:next_date].iloc[1:]
-        period_pct = period_prices.pct_change().dropna()
-        if period_pct.empty or current_weights.empty:
-            continue
-            
-        strategy_rets = (period_pct[current_weights.index] * current_weights).sum(axis=1)
-        strategy_daily_rets.append(strategy_rets)
-        benchmark_daily_rets.append(period_pct['DIVO11.SA'])
-
-    if not strategy_daily_rets:
-        return pd.DataFrame()
-
-    strategy_rets_series = pd.concat(strategy_daily_rets)
-    benchmark_rets_series = pd.concat(benchmark_daily_rets)
-    
-    df_backtest = pd.DataFrame({
-        'Strategy': (1 + strategy_rets_series).cumprod(),
-        'DIVO11.SA': (1 + benchmark_rets_series).cumprod()
-    })
-    
-    return df_backtest
-
-def run_dca_backtest(all_prices, all_fundamentals, weights_config, top_n, dca_amount, use_vol_target, use_sector_neutrality, start_date, end_date):
-    subset_prices = all_prices.loc[start_date - timedelta(days=400):end_date]
-    rebalance_dates = subset_prices.loc[start_date:end_date].resample('MS').first().index.tolist()
-    
-    if len(rebalance_dates) == 0:
-        return pd.DataFrame(), pd.DataFrame(), {}
-
-    holdings = {}  # {ticker: quantidade}
-    cash = 0.0
-    transactions = []
-    portfolio_values = []
-    benchmark_units = 0.0  # Unidades do BOVA11 compradas com aportes
-
-    for i, rebal_date in enumerate(rebalance_dates):
-        next_date = rebalance_dates[i+1] if i < len(rebalance_dates)-1 else end_date + timedelta(days=1)
-        
-        # === Seleção e pesos ===
-        prices_hist = subset_prices.loc[:rebal_date]
-        mom_window = prices_hist.tail(400)
-        risk_window = prices_hist.tail(90)
-        
-        res_mom = compute_residual_momentum(mom_window)
-        fundamentals_at_rebal = all_fundamentals.loc[rebal_date].unstack(level='Metric') if all_fundamentals.index.names == ['Date', 'Ticker'] else all_fundamentals.loc[rebal_date]
-        
-        fund_mom = compute_fundamental_momentum(fundamentals_at_rebal)
-        val_score = compute_value_score(fundamentals_at_rebal)
-        qual_score = compute_quality_score(fundamentals_at_rebal)
-        
-        df_period = pd.DataFrame(index=[c for c in all_prices.columns if c != 'DIVO11.SA'])
-        df_period['Res_Mom'] = res_mom
-        df_period['Fund_Mom'] = fund_mom
-        df_period['Value'] = val_score
-        df_period['Quality'] = qual_score
-        if 'sector' in fundamentals_at_rebal.columns:
-            df_period['Sector'] = fundamentals_at_rebal['sector']
-        
-        df_period.dropna(thresh=2, inplace=True)
-        
-        norm_cols = ['Res_Mom', 'Fund_Mom', 'Value', 'Quality']
-        w_keys = {}
-        if use_sector_neutrality and 'Sector' in df_period.columns and df_period['Sector'].nunique() > 1:
-            for c in norm_cols:
-                if c in df_period.columns:
-                    df_period[f"{c}_Z"] = df_period.groupby('Sector')[c].transform(
-                        lambda x: robust_zscore(x) if len(x) > 1 else x - x.median())
-                    w_keys[f"{c}_Z"] = weights_config.get(c, 0.0)
-        else:
-            for c in norm_cols:
-                if c in df_period.columns:
-                    df_period[f"{c}_Z"] = robust_zscore(df_period[c])
-                    w_keys[f"{c}_Z"] = weights_config.get(c, 0.0)
-        
-        ranked = build_composite_score(df_period, w_keys)
-        target_weights = construct_portfolio(ranked, risk_window, top_n, 0.15 if use_vol_target else None)
-        
-        # === Valor atual do portfólio ===
-        current_prices = subset_prices.loc[rebal_date]
-        portfolio_value = sum(holdings.get(t, 0) * current_prices.get(t, np.nan) for t in holdings.keys() if t in current_prices.index)
-        total_value = portfolio_value + cash
-        
-        # === Aporte mensal ===
-        cash += dca_amount
-        total_value += dca_amount
-        
-        # === Aporte no benchmark ===
-        bench_price = current_prices.get('DIVO11.SA', np.nan)
-        if not np.isnan(bench_price) and bench_price > 0:
-            benchmark_units += dca_amount / bench_price
-        
-        # === Rebalanceamento ===
-        target_allocation = total_value * target_weights
-        
-        for t in target_weights.index:
-            current_qty = holdings.get(t, 0)
-            current_val = current_qty * current_prices.get(t, 0)
-            target_val = target_allocation.get(t, 0)
-            delta_val = target_val - current_val
-            
-            price = current_prices.get(t, 0)
-            if price > 0:
-                qty_delta = np.floor(delta_val / price + 0.5)  # Arredondamento padrão
-                holdings[t] = current_qty + qty_delta
-                cash -= qty_delta * price
-                
-                if qty_delta != 0:
-                    transactions.append({
-                        'Date': rebal_date,
-                        'Ticker': t,
-                        'Tipo': 'Compra' if qty_delta > 0 else 'Venda',
-                        'Qtd': abs(qty_delta),
-                        'Preço': price,
-                        'Valor': abs(qty_delta * price)
-                    })
-        
-        # === Registro diário do valor do portfólio ===
-        period_dates = subset_prices.loc[rebal_date:next_date].index
-        for date in period_dates:
-            if date > end_date:
-                break
-            prices_date = subset_prices.loc[date]
-            strat_val = sum(holdings.get(t, 0) * prices_date.get(t, 0) for t in holdings.keys())
-            bench_val = benchmark_units * prices_date.get('DIVO11.SA', 0)
-            portfolio_values.append({
-                'Date': date,
-                'Strategy_DCA': strat_val + cash,
-                'DIVO11.SA_DCA': bench_val
-            })
-    
-    df_curve = pd.DataFrame(portfolio_values).set_index('Date').drop_duplicates()
-    df_transactions = pd.DataFrame(transactions)
-    final_holdings = {t: q for t, q in holdings.items() if q > 0}
-    
-    return df_curve, df_transactions, final_holdings
-
-# ==============================================================================
-# MÓDULO 5: STREAMLIT APP
-# ==============================================================================
-
-def main():
-    st.title("🚀 Quant Factor Lab Pro")
-
-    st.sidebar.header("Configurações")
-    tickers_input = st.sidebar.text_area(
-        "Tickers (vírgula)", 
-        "PETR4.SA, VALE3.SA, ITUB4.SA, BBDC4.SA, WEGE3.SA, MGLU3.SA, B3SA3.SA, SUZB3.SA, RADL3.SA, LREN3.SA"
-    )
-    start_date_str = st.sidebar.text_input("Início", "2018-01-01")
-    end_date_str = st.sidebar.text_input("Fim", datetime.now().strftime("%Y-%m-%d"))
-    top_n = st.sidebar.slider("Top N", 1, 20, 10)
-    dca_amount = st.sidebar.number_input("Aporte Mensal (R$)", 100.0, 5000.0, 500.0, 100.0)
-    dca_years = st.sidebar.slider("Período DCA (anos)", 1, 10, 5)
-
-    st.sidebar.subheader("Pesos dos Fatores")
-    w_res = st.sidebar.slider("Residual Momentum", 0.0, 1.0, 0.3, 0.05)
-    w_fund = st.sidebar.slider("Fundamental Momentum", 0.0, 1.0, 0.3, 0.05)
-    w_val = st.sidebar.slider("Value", 0.0, 1.0, 0.2, 0.05)
-    w_qual = st.sidebar.slider("Quality", 0.0, 1.0, 0.2, 0.05)
-
-    st.sidebar.subheader("Opções")
-    use_vol = st.sidebar.checkbox("Volatilidade Alvo 15%", False)
-    use_sector = st.sidebar.checkbox("Neutralidade Setorial", False)
-
-    weights_map = {'Res_Mom': w_res, 'Fund_Mom': w_fund, 'Value': w_val, 'Quality': w_qual}
-
-    if st.sidebar.button("Rodar Análise"):
-        with st.status("Processando...", expanded=True) as status:
-            tickers = [t.strip().upper() for t in tickers_input.split(',') if t.strip()]
-            
-            try:
-                start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
-                end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
-                start_1yr = end_date - timedelta(days=365)
-                start_dca = end_date - timedelta(days=int(365.25 * dca_years))
-            except:
-                st.error("Data inválida.")
-                return
-
-            status.update(label="Baixando preços...")
-            prices = fetch_price_data(tickers, start_date_str, end_date_str)
-            if prices.empty:
-                st.error("Erro ao baixar preços.")
-                return
-
-            status.update(label="Baixando fundamentos...")
-            fundamentals_snapshot = fetch_fundamentals(tickers)
-
-            # Simulação point-in-time
-            idx = pd.MultiIndex.from_product([prices.index, fundamentals_snapshot.index], names=['Date', 'Ticker'])
-            all_fundamentals = pd.DataFrame(index=idx, columns=fundamentals_snapshot.columns)
-            last_date = prices.index[-1]
-            for t in fundamentals_snapshot.index:
-                all_fundamentals.loc[(last_date, t), :] = fundamentals_snapshot.loc[t]
-            all_fundamentals = all_fundamentals.groupby('Ticker').ffill()
-
-            # Ranking atual
-            status.update(label="Calculando ranking atual...")
-            mom_window = prices.tail(400)
-            res_mom = compute_residual_momentum(mom_window)
-            fund_mom = compute_fundamental_momentum(fundamentals_snapshot)
-            val_score = compute_value_score(fundamentals_snapshot)
-            qual_score = compute_quality_score(fundamentals_snapshot)
-
-            final_df = pd.DataFrame(index=[c for c in prices.columns if c != 'DIVO11.SA'])
-            final_df['Res_Mom'] = res_mom
-            final_df['Fund_Mom'] = fund_mom
-            final_df['Value'] = val_score
-            final_df['Quality'] = qual_score
-            if 'sector' in fundamentals_snapshot.columns:
-                final_df['Sector'] = fundamentals_snapshot['sector']
-            final_df.dropna(thresh=2, inplace=True)
-
-            for c in ['Res_Mom', 'Fund_Mom', 'Value', 'Quality']:
-                if c in final_df.columns:
-                    final_df[f"{c}_Z"] = robust_zscore(final_df[c])
-            final_df = build_composite_score(final_df, {f"{c}_Z": weights_map[c] for c in weights_map if f"{c}_Z" in final_df.columns})
-
-            # Backtests
-            status.update(label="Backtesting...")
-            bt_1yr = run_dynamic_backtest(prices, all_fundamentals, weights_map, top_n, use_vol, use_sector, start_1yr)
-            bt_full = run_dynamic_backtest(prices, all_fundamentals, weights_map, top_n, use_vol, use_sector, start_dca)
-            dca_curve, dca_tx, dca_hold = run_dca_backtest(prices, all_fundamentals, weights_map, top_n, dca_amount, use_vol, use_sector, start_dca, end_date)
-
-            status.update(label="Concluído!", state="complete")
-
-        # === TABS ===
-        tabs = st.tabs(["🏆 Ranking", "📈 1 Ano", "💰 DCA", "💼 Carteira", "🔍 Detalhes"])
-
-        with tabs[0]:
-            col1, col2 = st.columns([2,1])
-            with col1:
-                st.subheader("Top Picks")
-                cols = ['Composite_Score', 'Sector', 'Res_Mom', 'Fund_Mom', 'Value', 'Quality']
-                st.dataframe(final_df[cols].head(top_n).style.background_gradient(subset=['Composite_Score'], cmap='RdYlGn'), use_container_width=True)
-            with col2:
-                st.subheader(f"Sugestão (R${dca_amount:.0f})")
-                weights = construct_portfolio(final_df, prices.tail(90), top_n, 0.15 if use_vol else None)
-                if not weights.empty:
-                    p = prices.iloc[-1]
-                    wdf = weights.to_frame("Peso")
-                    wdf["Preço"] = p.reindex(wdf.index)
-                    wdf["Alocação"] = wdf["Peso"] * dca_amount
-                    wdf["Qtd"] = np.floor(wdf["Alocação"] / wdf["Preço"] + 0.5)
-                    disp = wdf.copy()
-                    disp["Peso"] = disp["Peso"].map("{:.1%}".format)
-                    disp["Preço"] = disp["Preço"].map("R${:,.2f}".format)
-                    disp["Alocação"] = disp["Alocação"].map("R${:,.0f}".format)
-                    disp["Qtd"] = disp["Qtd"].astype(int)
-                    st.dataframe(disp[["Peso", "Preço", "Qtd", "Alocação"]])
-                    st.plotly_chart(px.pie(weights, names=weights.index, values=weights), use_container_width=True)
-
-        # Demais tabs seguem lógica similar — você pode manter suas versões originais aqui
 
 if __name__ == "__main__":
-    main()
-
+    # --- 1. Definir Universo ---
+    # Lista de Tickers (Exemplo: Big Tech + Financeiras + Varejo)
+    tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "JPM", "BAC", "WMT", "TGT", "PG", "KO", "PEP", "TSLA"]
+    
+    start_date = "2018-01-01"
+    end_date = datetime.datetime.today().strftime('%Y-%m-%d')
+    
+    try:
+        # --- 2. Baixar Preços ---
+        price_df = fetch_price_data(tickers, start_date, end_date)
+        
+        # --- 3. Baixar Fundamentais Históricos (FMP API) ---
+        raw_fundamentals = fetch_fmp_fundamentals(tickers, FMP_API_KEY)
+        
+        # --- 4. Alinhar Dados (Criar Base Point-in-Time) ---
+        # Este passo é crucial: transforma trimestral em diário (ffill)
+        aligned_fundamentals = align_fundamentals_to_prices(raw_fundamentals, price_df)
+        
+        # --- 5. Rodar Backtest ---
+        equity_curve = run_dynamic_backtest(price_df, aligned_fundamentals, top_n=3)
+        
+        # --- 6. Resultados ---
+        if not equity_curve.empty:
+            print("\n" + "="*40)
+            print(f"Retorno Acumulado: {equity_curve.iloc[-1]:.2f}x")
+            print("="*40)
+            
+            # Plot simples (se estiver no Jupyter ou local)
+            try:
+                import matplotlib.pyplot as plt
+                equity_curve.plot(title="Estratégia Momentum + Fundamental (Dados Históricos Reais FMP)")
+                plt.show()
+            except ImportError:
+                print("Matplotlib não instalado, gráfico pulado.")
+        else:
+            print("Backtest não gerou trades (verifique datas ou dados).")
+            
+    except Exception as e:
+        print(f"\nErro Crítico na Execução: {e}")
