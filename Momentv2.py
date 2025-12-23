@@ -25,10 +25,10 @@ FMP_API_KEY = "rd6uBzkLLSPG68s9GcSx3folN76IxRhV"
 
 @st.cache_data(ttl=3600*12)
 def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFrame:
-    """Busca histórico de preços ajustados, garantindo o benchmark BOVA11.SA."""
+    """Busca histórico de preços ajustados, garantindo o benchmark DIVO11.SA."""
     t_list = list(tickers)
-    if 'BOVA11.SA' not in t_list:
-        t_list.append('BOVA11.SA')
+    if 'DIVO11.SA' not in t_list:
+        t_list.append('DIVO11.SA')
     
     try:
         # Download otimizado
@@ -82,7 +82,7 @@ def fetch_fmp_fundamentals_history(tickers: list, api_key: str) -> tuple:
     total_t = len(tickers)
 
     for i, t in enumerate(tickers):
-        if t == 'BOVA11.SA': 
+        if t == 'DIVO11.SA': 
             continue
             
         # Ajuste Ticker (Remove .SA para FMP se necessário, mas FMP aceita .SA geralmente)
@@ -171,22 +171,22 @@ def align_fundamentals_to_prices(fund_df, price_df):
 # ==============================================================================
 
 def compute_residual_momentum(price_df: pd.DataFrame, lookback=12, skip=1) -> pd.Series:
-    """Calcula Residual Momentum (Alpha) vs BOVA11.SA."""
+    """Calcula Residual Momentum (Alpha) vs DIVO11.SA."""
     df = price_df.copy()
     # Resample para mensal para cálculo clássico de momentum
     monthly = df.resample('ME').last()
     rets = monthly.pct_change().dropna()
     
-    if 'BOVA11.SA' not in rets.columns: 
+    if 'DIVO11.SA' not in rets.columns: 
         # Tenta recuperar se o nome for diferente ou retorna vazio
         return pd.Series(dtype=float)
         
-    market = rets['BOVA11.SA']
+    market = rets['DIVO11.SA']
     scores = {}
     window = lookback + skip
     
     for ticker in rets.columns:
-        if ticker == 'BOVA11.SA': continue
+        if ticker == 'DIVO11.SA': continue
         
         y = rets[ticker].tail(window)
         x = market.tail(window)
@@ -419,8 +419,8 @@ def run_dynamic_backtest(
         else:
             strat_ret = pd.Series(0.0, index=period_pct.index)
             
-        if 'BOVA11.SA' in period_pct.columns:
-            bench_ret = period_pct['BOVA11.SA']
+        if 'DIVO11.SA' in period_pct.columns:
+            bench_ret = period_pct['DIVO11.SA']
         else:
             bench_ret = pd.Series(0.0, index=period_pct.index)
             
@@ -436,7 +436,7 @@ def run_dynamic_backtest(
         
         cumulative = pd.DataFrame({
             'Strategy': (1 + full_strategy).cumprod(),
-            'BOVA11.SA': (1 + full_benchmark).cumprod()
+            'DIVO11.SA': (1 + full_benchmark).cumprod()
         })
         return cumulative.dropna()
     return pd.DataFrame()
@@ -466,7 +466,7 @@ def run_dca_backtest(
     portfolio_value = pd.Series(0.0, index=all_prices.index)
     benchmark_value = pd.Series(0.0, index=all_prices.index)
     portfolio_holdings = {} 
-    benchmark_holdings = {'BOVA11.SA': 0.0}
+    benchmark_holdings = {'DIVO11.SA': 0.0}
     monthly_transactions = []
     
     for i, rebal_date in enumerate(dca_dates):
@@ -541,10 +541,10 @@ def run_dca_backtest(
             continue
             
         # 1. Compra Benchmark
-        bova_price = curr_prices_row.get('BOVA11.SA', np.nan)
+        bova_price = curr_prices_row.get('DIVO11.SA', np.nan)
         if not np.isnan(bova_price) and bova_price > 0:
             q_bova = dca_amount / bova_price
-            benchmark_holdings['BOVA11.SA'] += q_bova
+            benchmark_holdings['DIVO11.SA'] += q_bova
         
         # 2. Compra Estratégia
         for ticker, weight in current_weights.items():
@@ -576,14 +576,14 @@ def run_dca_backtest(
             portfolio_value[d] = strat_val
             
             # Valor Bench
-            if 'BOVA11.SA' in day_prices:
-                benchmark_value[d] = day_prices['BOVA11.SA'] * benchmark_holdings['BOVA11.SA']
+            if 'DIVO11.SA' in day_prices:
+                benchmark_value[d] = day_prices['DIVO11.SA'] * benchmark_holdings['DIVO11.SA']
         
     # Limpeza final
     portfolio_value = portfolio_value[portfolio_value > 0].ffill()
     benchmark_value = benchmark_value[benchmark_value > 0].ffill()
     
-    equity_curve = pd.DataFrame({'Strategy_DCA': portfolio_value, 'BOVA11.SA_DCA': benchmark_value}).dropna()
+    equity_curve = pd.DataFrame({'Strategy_DCA': portfolio_value, 'DIVO11.SA_DCA': benchmark_value}).dropna()
     final_holdings = {k: v for k, v in portfolio_holdings.items() if v > 0}
     
     return equity_curve, pd.DataFrame(monthly_transactions), final_holdings
@@ -755,7 +755,7 @@ def main():
             st.subheader("Backtest Walk-Forward (Últimos 12 Meses)")
             if not bt_1yr.empty:
                 ret_strat = bt_1yr['Strategy'].iloc[-1] - 1
-                ret_bench = bt_1yr['BOVA11.SA'].iloc[-1] - 1
+                ret_bench = bt_1yr['DIVO11.SA'].iloc[-1] - 1
                 vol = bt_1yr.pct_change().std() * (252**0.5)
                 
                 c1, c2, c3 = st.columns(3)
@@ -764,7 +764,7 @@ def main():
                 c3.metric("Sharpe", f"{(ret_strat)/vol['Strategy']:.2f}")
                 
                 st.plotly_chart(px.line(bt_1yr, title="Curva de Retorno Comparativa", 
-                                       color_discrete_map={'Strategy': '#00CC96', 'BOVA11.SA': '#EF553B'}), 
+                                       color_discrete_map={'Strategy': '#00CC96', 'DIVO11.SA': '#EF553B'}), 
                                 use_container_width=True)
             else:
                 st.warning("Dados insuficientes para gerar backtest deste período.")
@@ -815,3 +815,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
