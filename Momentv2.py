@@ -51,93 +51,72 @@ def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFr
 
 @st.cache_data(ttl=3600*24)
 def fetch_fmp_fundamentals_history(tickers: list, api_key: str) -> tuple:
-    """
-    Busca histórico trimestral de métricas e perfil (setor) via FMP.
-    Retorna (DataFrame Histórico Bruto, DataFrame de Setores).
-    """
     all_data = []
     sector_map = {}
     
-    # Mapeamento: FMP JSON Key -> Colunas esperadas pelo script
-    # Nota: Usamos peRatio como proxy para forwardPE na falta de consenso histórico, 
-    # ou podemos usar o dado raw. O script usa 'forwardPE', 'priceToBook', etc.
     column_mapping = {
-        'date': 'date',
-        'symbol': 'ticker',
-        'peRatio': 'forwardPE',         # Proxy: P/E Histórico
-        'pbRatio': 'priceToBook',
-        'roe': 'returnOnEquity',
-        'netProfitMargin': 'profitMargins',
-        'debtToEquity': 'debtToEquity',
+        'date': 'date', 'symbol': 'ticker', 'peRatio': 'forwardPE',
+        'pbRatio': 'priceToBook', 'roe': 'returnOnEquity',
+        'netProfitMargin': 'profitMargins', 'debtToEquity': 'debtToEquity',
         'enterpriseValueOverEBITDA': 'enterpriseToEbitda',
-        'revenueGrowth': 'revenueGrowth', # FMP Key Metrics às vezes tem growth, senão calculamos
-        'netIncomeGrowth': 'earningsGrowth'
+        'revenueGrowth': 'revenueGrowth', 'netIncomeGrowth': 'earningsGrowth'
     }
 
     session = requests.Session()
+    my_bar = st.progress(0, text="Acessando API FMP...")
     
-    # Progresso na UI
-    progress_text = "Baixando dados fundamentais históricos (FMP)..."
-    my_bar = st.progress(0, text=progress_text)
-    total_t = len(tickers)
-
     for i, t in enumerate(tickers):
-        if t == 'DIVO11.SA': 
-            continue
+        if t == 'BOVA11.SA': continue
             
-        # Ajuste Ticker (Remove .SA para FMP se necessário, mas FMP aceita .SA geralmente)
-        # Se falhar, tente t.replace('.SA', '')
-        ticker_query = t 
-
+        # CORREÇÃO 1: Remover .SA para consulta na FMP (A maioria dos dados BR na FMP usa apenas o código ou código.SA, mas o tratamento garante compatibilidade)
+        fmp_ticker = t # Tente manter .SA primeiro, se falhar o código abaixo trata
+        
         try:
-            # 1. Busca Histórico (Key Metrics Trimestral) - 10 anos aprox (40 quarters)
-            url_metrics = f"https://financialmodelingprep.com/api/v3/key-metrics/{ticker_query}?period=quarter&limit=60&apikey={api_key}"
+            # 1. Busca Métricas
+            url_metrics = f"https://financialmodelingprep.com/api/v3/key-metrics/{fmp_ticker}?period=quarter&limit=60&apikey={api_key}"
             resp = session.get(url_metrics)
             data_metrics = resp.json()
-            
-            # 2. Busca Setor (Profile)
-            url_profile = f"https://financialmodelingprep.com/api/v3/profile/{ticker_query}?apikey={api_key}"
-            resp_prof = session.get(url_profile)
-            data_prof = resp_prof.json()
-            
-            # Processar Setor
-            if isinstance(data_prof, list) and len(data_prof) > 0:
-                sector_map[t] = data_prof[0].get('sector', 'Unknown')
-            else:
-                sector_map[t] = 'Unknown'
 
-            # Processar Métricas
+            # Se a lista vier vazia com .SA, tenta sem o sufixo
+            if not data_metrics and ".SA" in t:
+                fmp_ticker = t.replace(".SA", "")
+                url_metrics = f"https://financialmodelingprep.com/api/v3/key-metrics/{fmp_ticker}?period=quarter&limit=60&apikey={api_key}"
+                resp = session.get(url_metrics)
+                data_metrics = resp.json()
+
+            # 2. Processar Profile (Setor)
+            url_profile = f"https://financialmodelingprep.com/api/v3/profile/{fmp_ticker}?apikey={api_key}"
+            data_prof = session.get(url_profile).json()
+            sector_map[t] = data_prof[0].get('sector', 'Unknown') if data_prof else 'Unknown'
+
+            # 3. Validar e concatenar
             if isinstance(data_metrics, list) and len(data_metrics) > 0:
                 df = pd.DataFrame(data_metrics)
-                # Filtra e Renomeia
                 cols_exist = [c for c in column_mapping.keys() if c in df.columns]
                 df = df[cols_exist].rename(columns=column_mapping)
-                df['ticker'] = t
+                df['ticker'] = t # Mantém o ticker original (com .SA) para dar match com o yfinance
                 df['date'] = pd.to_datetime(df['date'])
                 
-                # Garantir colunas essenciais com NaN se faltarem
+                # Preencher colunas faltantes com NaN
                 for target_col in column_mapping.values():
                     if target_col not in df.columns and target_col not in ['date', 'ticker']:
                         df[target_col] = np.nan
-                        
                 all_data.append(df)
-            
+            else:
+                st.warning(f"FMP não retornou dados para {t}")
+
         except Exception as e:
-            # Silencia erros individuais para não parar o fluxo
-            print(f"Erro FMP para {t}: {e}")
+            st.error(f"Erro na API FMP para {t}: {e}")
             
-        my_bar.progress((i + 1) / total_t)
+        my_bar.progress((i + 1) / len(tickers))
         
     my_bar.empty()
     
     if not all_data:
         return pd.DataFrame(), pd.DataFrame()
         
-    full_history = pd.concat(all_data, ignore_index=True)
-    sectors_df = pd.DataFrame(list(sector_map.items()), columns=['ticker', 'sector']).set_index('ticker')
+    return pd.concat(all_data, ignore_index=True), pd.DataFrame(list(sector_map.items()), columns=['ticker', 'sector']).set_index('ticker')
     
-    return full_history, sectors_df
-
 def align_fundamentals_to_prices(fund_df, price_df):
     """
     Expande os dados trimestrais para diários (Point-in-Time) usando Forward Fill.
@@ -639,9 +618,19 @@ def main():
             st.write("📡 Baixando Fundamentos Históricos (FMP)...")
             raw_history, sector_df = fetch_fmp_fundamentals_history(tickers, FMP_API_KEY)
             
-            if prices.empty or raw_history.empty:
-                st.error("Dados insuficientes (Preço ou FMP). Verifique Tickers ou API Key.")
-                status.update(label="Erro!", state="error")
+            # No main(), verifique se há interseção de tickers antes de rodar o backtest
+            if prices.empty:
+                st.error("Erro: yfinance não retornou preços. Verifique sua conexão ou tickers.")
+                return
+            
+            if raw_history.empty:
+                st.error("Erro: FMP não retornou fundamentos. Verifique se sua API Key é válida para o plano 'Starter' ou superior.")
+                return
+            
+            # Verificação de tickers comuns
+            common_tickers = set(prices.columns).intersection(set(raw_history['ticker'].unique()))
+            if not common_tickers:
+                st.error(f"Erro de Sincronia: Os tickers do Preço ({list(prices.columns)[:3]}...) não batem com os da FMP ({raw_history['ticker'].unique()[:3]}...).")
                 return
             
             # 3. Align Fundamentals (Point-in-Time)
@@ -815,4 +804,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
