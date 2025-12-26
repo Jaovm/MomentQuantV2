@@ -5,10 +5,26 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from scipy import stats
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# Configuração da Página
-st.set_page_config(page_title="Painel Quantitativo de Ações BR", layout="wide")
+# --- Configuração da Página ---
+st.set_page_config(
+    page_title="Painel Quantitativo de Ações BR", 
+    layout="wide",
+    page_icon="📈"
+)
+
+# --- CSS Customizado para visual ---
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 15px;
+        border-radius: 10px;
+        border-left: 5px solid #ff4b4b;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # --- 1. Definição do Universo e Inputs ---
 DEFAULT_TICKERS = [
@@ -20,83 +36,94 @@ BENCHMARK = "^BVSP" # Ibovespa
 
 # --- 2. Funções de Coleta e Cálculo ---
 
-@st.cache_data
+@st.cache_data(ttl=3600) # Cache de 1 hora
 def get_stock_data(tickers, benchmark, period="5y"):
-    """Coleta dados de preço ajustado e dados fundamentais básicos."""
-    data = yf.download(tickers + [benchmark], period=period, group_by='ticker', auto_adjust=True)
+    """Coleta dados de preço ajustado."""
+    with st.spinner('Baixando histórico de preços...'):
+        tickers_list = tickers + [benchmark]
+        # Download otimizado
+        data = yf.download(tickers_list, period=period, group_by='ticker', auto_adjust=True, threads=True)
     
-    # Estrutura para preços de fechamento
     close_prices = pd.DataFrame()
     for t in tickers:
         try:
-            close_prices[t] = data[t]['Close']
+            # Verifica se o ticker existe no dataframe baixado
+            if t in data.columns.levels[0]:
+                close_prices[t] = data[t]['Close']
         except KeyError:
-            pass
+            continue
     
-    try:
-        close_prices['BENCHMARK'] = data[benchmark]['Close']
-    except KeyError:
-         close_prices['BENCHMARK'] = data[benchmark]['Close'] # Retry logic usually handled internally
+    # Tratamento para o Benchmark
+    if benchmark in data.columns.levels[0]:
+         close_prices['BENCHMARK'] = data[benchmark]['Close']
             
     return close_prices.dropna(how='all')
 
-@st.cache_data
+@st.cache_data(ttl=3600)
 def get_fundamentals(tickers):
     """Coleta indicadores fundamentalistas (Snapshot Atual)."""
-    # Nota: Em produção, usar API paga (Economatica/Bloomberg) para evitar lentidão e dados faltantes.
     metrics = []
     
-    for t in tickers:
+    # Barra de progresso visual
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    total = len(tickers)
+    for i, t in enumerate(tickers):
+        status_text.text(f"Baixando fundamentos: {t} ({i+1}/{total})")
         try:
             stock = yf.Ticker(t)
             info = stock.info
             
-            # Tratamento de erros para dados faltantes
             def get_val(key):
-                return info.get(key, np.nan)
+                val = info.get(key, np.nan)
+                return val if val is not None else np.nan
 
             metrics.append({
                 'Ticker': t,
+                'Nome': info.get('shortName', t),
+                'Setor': info.get('sector', 'Outros'),
                 'ROE': get_val('returnOnEquity'),
                 'Margem Líquida': get_val('profitMargins'),
-                'Dívida/EBITDA': get_val('debtToEquity'), # Proxy simples
+                'Dívida/EBITDA': get_val('debtToEquity'), # Proxy
                 'Crescimento Lucro': get_val('earningsGrowth'),
                 'P/L': get_val('trailingPE'),
                 'P/VP': get_val('priceToBook'),
-                'EV/EBITDA': get_val('enterpriseToEbitda'), # Usando EBITDA como proxy de EBIT comum na API free
+                'EV/EBITDA': get_val('enterpriseToEbitda'),
                 'Dividend Yield': get_val('dividendYield')
             })
         except:
             metrics.append({'Ticker': t})
+        
+        progress_bar.progress((i + 1) / total)
             
+    status_text.empty()
+    progress_bar.empty()
+    
     df = pd.DataFrame(metrics)
     return df.set_index('Ticker')
 
 def calculate_residual_momentum(prices_df, lookback_months=12, exclude_recent_months=1):
-    """
-    Calcula o Momentum Residual.
-    Regressão do retorno da ação contra o benchmark. O resíduo é o alpha ajustado.
-    """
+    """Calcula o Momentum Residual (Alpha ajustado)."""
     momentum_scores = {}
     
-    # Definir janela (aprox 21 dias uteis por mês)
     window = lookback_months * 21
     skip = exclude_recent_months * 21
     
     if len(prices_df) < window + skip:
         return pd.Series()
 
-    # Preços defasados (para evitar momentum de curtíssimo prazo de reversão)
     recent_prices = prices_df.iloc[:-skip]
     
     for col in prices_df.columns:
         if col == 'BENCHMARK': continue
         
-        # Série temporal dos últimos 'window' dias
         asset_ret = recent_prices[col].pct_change().tail(window).dropna()
+        if 'BENCHMARK' not in recent_prices.columns:
+            continue
+            
         bench_ret = recent_prices['BENCHMARK'].pct_change().tail(window).dropna()
         
-        # Alinhar dados
         common_idx = asset_ret.index.intersection(bench_ret.index)
         if len(common_idx) < window * 0.8:
             momentum_scores[col] = np.nan
@@ -105,173 +132,253 @@ def calculate_residual_momentum(prices_df, lookback_months=12, exclude_recent_mo
         y = asset_ret.loc[common_idx]
         x = bench_ret.loc[common_idx]
         
-        # Regressão Linear (Slope e Intercept)
-        slope, intercept, _, _, _ = stats.linregress(x, y)
-        
-        # Calcular Resíduos (Retorno anormal)
-        expected_ret = intercept + slope * x
-        residuals = y - expected_ret
-        
-        # Score = Média do resíduo / Desvio Padrão do resíduo (Information Ratio do Momentum)
-        score = residuals.mean() / residuals.std()
-        momentum_scores[col] = score
+        try:
+            slope, intercept, _, _, _ = stats.linregress(x, y)
+            expected_ret = intercept + slope * x
+            residuals = y - expected_ret
+            score = residuals.mean() / residuals.std() if residuals.std() != 0 else 0
+            momentum_scores[col] = score
+        except:
+            momentum_scores[col] = np.nan
         
     return pd.Series(momentum_scores, name='Residual Momentum')
 
 # --- 3. Interface do Streamlit ---
 
-st.sidebar.header("⚙️ Configurações do Painel")
+st.sidebar.header("⚙️ Configurações")
 selected_tickers = st.sidebar.multiselect("Universo de Ações", DEFAULT_TICKERS, default=DEFAULT_TICKERS)
-period_input = st.sidebar.selectbox("Período de Análise", ["1y", "3y", "5y"], index=1)
+period_input = st.sidebar.selectbox("Período de Análise", ["1y", "3y", "5y"], index=2)
 
-if st.sidebar.button("Gerar Painel"):
-    with st.spinner('Baixando dados de mercado e calculando fatores...'):
-        
-        # 1. Dados
-        prices = get_stock_data(selected_tickers, BENCHMARK, period="5y") # Baixa 5y para ter histórico suficiente
+st.sidebar.markdown("---")
+st.sidebar.info("**Nota:** Dados obtidos via Yahoo Finance. Podem haver atrasos ou lacunas em fundamentos específicos de Small Caps.")
+
+if st.sidebar.button("🚀 Gerar Painel de Decisão"):
+    if not selected_tickers:
+        st.error("Por favor, selecione pelo menos um ativo.")
+    else:
+        # 1. Coleta de Dados
+        prices = get_stock_data(selected_tickers, BENCHMARK, period="5y")
         df_funds = get_fundamentals(selected_tickers)
         
-        # 2. Cálculos de Fatores
-        # Normalização e Tratamento
+        # 2. Cálculos e Tratamento
         df_funds['ROE'] = df_funds['ROE'].fillna(0) * 100
         df_funds['Margem Líquida'] = df_funds['Margem Líquida'].fillna(0) * 100
         df_funds['Dividend Yield'] = df_funds['Dividend Yield'].fillna(0) * 100
         
-        # Inverter métricas onde menor é melhor
+        # Inverter métricas onde "menor é melhor" para o ranking
         df_calc = df_funds.copy()
         
-        # Calcular Scores (Rank Percentil) - 0 a 1
-        # Quality
-        q_score = (df_calc['ROE'].rank(pct=True) + 
-                   df_calc['Margem Líquida'].rank(pct=True) + 
-                   df_calc['Crescimento Lucro'].rank(pct=True) - 
-                   df_calc['Dívida/EBITDA'].rank(pct=True)) # Menor dívida é melhor
+        # Quality Score
+        q_rank = (df_calc['ROE'].rank(pct=True) + 
+                  df_calc['Margem Líquida'].rank(pct=True) + 
+                  df_calc['Crescimento Lucro'].rank(pct=True) - 
+                  df_calc['Dívida/EBITDA'].fillna(100).rank(pct=True)) 
         
-        # Value
-        # Para P/L, EV/EBITDA e P/VP, menor é melhor, então invertemos o rank
-        v_score = (df_calc['Dividend Yield'].rank(pct=True) + 
-                   (1 - df_calc['P/L'].rank(pct=True)) + 
-                   (1 - df_calc['P/VP'].rank(pct=True)) + 
-                   (1 - df_calc['EV/EBITDA'].rank(pct=True)))
+        # Value Score (Invertendo P/L, EV/EBITDA, P/VP)
+        v_rank = (df_calc['Dividend Yield'].rank(pct=True) + 
+                  (1 - df_calc['P/L'].fillna(100).rank(pct=True)) + 
+                  (1 - df_calc['P/VP'].fillna(100).rank(pct=True)) + 
+                  (1 - df_calc['EV/EBITDA'].fillna(100).rank(pct=True)))
         
-        # Momentum Residual (12 meses, excluindo último mês)
+        # Momentum Residual
         mom_resid = calculate_residual_momentum(prices, lookback_months=12, exclude_recent_months=1)
         
-        # Consolidar Tabela Mestra
+        # Consolidar
         master_df = df_funds.copy()
         master_df['Residual Momentum'] = mom_resid
-        master_df['Quality Score'] = q_score
-        master_df['Value Score'] = v_score
         
-        # Normalizar Scores finais (0 a 100)
-        master_df['Quality Rank'] = (master_df['Quality Score'].rank(pct=True) * 100).round(1)
-        master_df['Value Rank'] = (master_df['Value Score'].rank(pct=True) * 100).round(1)
-        master_df['Momentum Rank'] = (master_df['Residual Momentum'].rank(pct=True) * 100).round(1)
+        # Normalização Final (0 a 100)
+        master_df['Quality Rank'] = (q_rank.rank(pct=True) * 100).fillna(0).round(1)
+        master_df['Value Rank'] = (v_rank.rank(pct=True) * 100).fillna(0).round(1)
+        master_df['Momentum Rank'] = (master_df['Residual Momentum'].rank(pct=True) * 100).fillna(0).round(1)
         
-        master_df['Score Geral'] = ((master_df['Quality Rank'] + master_df['Value Rank'] + master_df['Momentum Rank'])/3).round(1)
+        # Score Geral (Média Ponderada Igualitária)
+        master_df['Score Geral'] = ((master_df['Quality Rank'] + 
+                                     master_df['Value Rank'] + 
+                                     master_df['Momentum Rank']) / 3).round(1)
 
-        # --- Layout do Dashboard ---
-        
-        st.title(f"📊 Painel de Decisão Quantitativa: {len(selected_tickers)} Ativos")
+        # --- Dashboard ---
+        st.title(f"📊 Painel de Decisão Quantitativa")
+        st.markdown(f"**Universo:** {len(selected_tickers)} Ativos | **Benchmark:** Ibovespa")
         st.markdown("---")
 
-        # TAB 1: Rankings e Fatores
-        tab1, tab2, tab3 = st.tabs(["🏆 Rankings e Fatores", "📈 Backtest e Performance", "🧠 Insights e Correlações"])
+        tab1, tab2, tab3 = st.tabs(["🏆 Rankings e Sugestão de Aporte", "📈 Backtest de Estratégias", "🧠 Correlações e Insights"])
         
+        # === TAB 1: RANKINGS E SUGESTÃO ===
         with tab1:
             col1, col2 = st.columns(2)
+            
             with col1:
-                st.subheader("Top Picks (Score Combinado)")
+                st.subheader("Top Picks (Score Global)")
+                st.caption("Média de Qualidade, Valor e Momentum")
                 top_picks = master_df.sort_values(by='Score Geral', ascending=False).head(10)
-                st.dataframe(top_picks[['Quality Rank', 'Value Rank', 'Momentum Rank', 'Score Geral']], use_container_width=True)
+                st.dataframe(
+                    top_picks[['Score Geral', 'Quality Rank', 'Value Rank', 'Momentum Rank']]
+                    .style.background_gradient(cmap='Blues'), 
+                    use_container_width=True
+                )
             
             with col2:
-                st.subheader("Múltiplos e Fundamentos")
+                st.subheader("Indicadores Fundamentais")
+                st.caption("Visão bruta dos dados coletados")
                 st.dataframe(master_df[['P/L', 'ROE', 'Dividend Yield', 'Residual Momentum']].style.format("{:.2f}"), use_container_width=True)
-                
-            st.markdown("### Detalhamento por Fator")
-            c1, c2, c3 = st.columns(3)
-            c1.info(f"**Top Quality:** {master_df.sort_values(by='Quality Rank', ascending=False).index[0]}")
-            c2.success(f"**Top Value:** {master_df.sort_values(by='Value Rank', ascending=False).index[0]}")
-            c3.warning(f"**Top Momentum:** {master_df.sort_values(by='Momentum Rank', ascending=False).index[0]}")
-
-        # TAB 2: Backtest
-        with tab2:
-            st.markdown(f"#### Backtest Comparativo ({period_input}) vs Ibovespa")
             
-            # Definir data de corte
+            # KPI Cards
+            st.markdown("##### Líderes por Fator")
+            c1, c2, c3 = st.columns(3)
+            try:
+                top_q = master_df.sort_values(by='Quality Rank', ascending=False).index[0]
+                top_v = master_df.sort_values(by='Value Rank', ascending=False).index[0]
+                top_m = master_df.sort_values(by='Momentum Rank', ascending=False).index[0]
+                c1.info(f"💎 **Top Quality:** {top_q}")
+                c2.success(f"💰 **Top Value:** {top_v}")
+                c3.warning(f"🚀 **Top Momentum:** {top_m}")
+            except:
+                pass
+
+            # --- SEÇÃO DE SUGESTÃO DE APORTE ---
+            st.markdown("---")
+            st.header("💰 Sugestão de Aporte Inteligente (Mês Atual)")
+            st.markdown("""
+            Abaixo apresentamos uma carteira sugerida para novos aportes, baseada no **Smart Beta**. 
+            O peso é calculado proporcionalmente ao *Score Geral* dos Top 5 ativos.
+            """)
+
+            # Lógica
+            top_n = 5
+            suggestion_df = master_df.sort_values(by='Score Geral', ascending=False).head(top_n).copy()
+            
+            if not suggestion_df.empty:
+                total_score = suggestion_df['Score Geral'].sum()
+                suggestion_df['Peso Ideal (%)'] = (suggestion_df['Score Geral'] / total_score * 100).round(1)
+                
+                # Identificar Driver
+                def identify_driver(row):
+                    factors = {
+                        '💎 Quality': row['Quality Rank'], 
+                        '💰 Value': row['Value Rank'], 
+                        '🚀 Momentum': row['Momentum Rank']
+                    }
+                    return max(factors, key=factors.get)
+
+                suggestion_df['Fator Dominante'] = suggestion_df.apply(identify_driver, axis=1)
+                
+                col_sug_1, col_sug_2 = st.columns([1, 2])
+                
+                with col_sug_1:
+                    best_asset = suggestion_df.iloc[0]
+                    st.markdown(f"""
+                    <div class="metric-card">
+                        <h3>⭐ Destaque do Mês: {best_asset.name}</h3>
+                        <h1>{best_asset['Peso Ideal (%)']}% <span style='font-size:16px'>de alocação</span></h1>
+                        <p><b>Score Geral:</b> {best_asset['Score Geral']}</p>
+                        <p><b>Fator Dominante:</b> {best_asset['Fator Dominante']}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                with col_sug_2:
+                    st.subheader("Carteira de Aporte Sugerida")
+                    st.dataframe(
+                        suggestion_df[['Peso Ideal (%)', 'Fator Dominante', 'Score Geral', 'P/L', 'Dividend Yield']]
+                        .style.background_gradient(subset=['Peso Ideal (%)'], cmap='Greens')
+                        .format("{:.1f}", subset=['Score Geral', 'Peso Ideal (%)', 'Dividend Yield'])
+                        .format("{:.1f}x", subset=['P/L']),
+                        use_container_width=True
+                    )
+            else:
+                st.warning("Dados insuficientes para gerar sugestão.")
+
+        # === TAB 2: BACKTEST ===
+        with tab2:
+            st.markdown(f"#### Performance Histórica Simulada ({period_input})")
+            
             days_map = {"1y": 252, "3y": 252*3, "5y": 252*5}
             lookback = days_map.get(period_input, 252)
             
-            bt_prices = prices.iloc[-lookback:].copy()
-            bt_ret = bt_prices.pct_change().dropna()
-            
-            # Estratégias Simplificadas (Equally Weighted nos Top Tier)
-            # Nota: Isso é um backtest estático (seleção atual mantida para trás) para fins de demonstração
-            top_q = master_df.sort_values('Quality Rank', ascending=False).head(int(len(master_df)*0.3)).index
-            top_v = master_df.sort_values('Value Rank', ascending=False).head(int(len(master_df)*0.3)).index
-            top_m = master_df.sort_values('Momentum Rank', ascending=False).head(int(len(master_df)*0.4)).index
-            top_combo = master_df.sort_values('Score Geral', ascending=False).head(5).index
-            
-            # Calcular equity curves
-            cum_ret = (1 + bt_ret).cumprod()
-            
-            strategies = {
-                'Ibovespa': cum_ret['BENCHMARK'],
-                'Top Quality (30%)': cum_ret[top_q].mean(axis=1),
-                'Top Value (30%)': cum_ret[top_v].mean(axis=1),
-                'Top Momentum (40%)': cum_ret[top_m].mean(axis=1),
-                'Top Combo (Top 5)': cum_ret[top_combo].mean(axis=1)
-            }
-            
-            df_equity = pd.DataFrame(strategies)
-            df_equity = df_equity / df_equity.iloc[0] * 100 # Base 100
-            
-            # Gráfico
-            fig_bt = px.line(df_equity, title="Curva de Retorno Acumulado (Base 100)")
-            st.plotly_chart(fig_bt, use_container_width=True)
-            
-            # Tabela de Métricas
-            metrics_bt = []
-            for name, series in strategies.items():
-                total_ret = (series.iloc[-1] / series.iloc[0]) - 1
-                vol = series.pct_change().std() * (252**0.5)
-                sharpe = (total_ret) / vol if vol > 0 else 0
+            if len(prices) > 20:
+                bt_prices = prices.iloc[-lookback:].copy()
+                bt_ret = bt_prices.pct_change().dropna()
                 
-                # Drawdown
-                roll_max = series.cummax()
-                drawdown = (series - roll_max) / roll_max
-                max_dd = drawdown.min()
+                # Definição das Carteiras Teóricas (Viés de Look-ahead para análise de fator atual)
+                top_q_idx = master_df.sort_values('Quality Rank', ascending=False).head(int(len(master_df)*0.3)).index
+                top_v_idx = master_df.sort_values('Value Rank', ascending=False).head(int(len(master_df)*0.3)).index
+                top_m_idx = master_df.sort_values('Momentum Rank', ascending=False).head(int(len(master_df)*0.4)).index
+                top_combo_idx = master_df.sort_values('Score Geral', ascending=False).head(5).index
                 
-                metrics_bt.append({
-                    'Estratégia': name,
-                    'Retorno Total': f"{total_ret*100:.2f}%",
-                    'Volatilidade (aa)': f"{vol*100:.2f}%",
-                    'Sharpe Ratio': f"{sharpe:.2f}",
-                    'Max Drawdown': f"{max_dd*100:.2f}%"
-                })
-            
-            st.table(pd.DataFrame(metrics_bt).set_index('Estratégia'))
-            st.caption("*Nota: O backtest de Quality e Value assume a manutenção da carteira atual (viés de look-ahead) para demonstrar a qualidade dos ativos selecionados hoje. O Momentum é calculado historicamente.*")
+                # Filtrar apenas colunas que existem no bt_ret
+                def get_valid_cols(indices, df_ret):
+                    return [c for c in indices if c in df_ret.columns]
 
-        # TAB 3: Visualizações Avançadas
+                strategies = {}
+                if 'BENCHMARK' in bt_ret.columns:
+                    strategies['Ibovespa'] = (1 + bt_ret['BENCHMARK']).cumprod()
+                
+                cols_q = get_valid_cols(top_q_idx, bt_ret)
+                cols_v = get_valid_cols(top_v_idx, bt_ret)
+                cols_m = get_valid_cols(top_m_idx, bt_ret)
+                cols_combo = get_valid_cols(top_combo_idx, bt_ret)
+                
+                if cols_q: strategies['Top Quality (30%)'] = (1 + bt_ret[cols_q].mean(axis=1)).cumprod()
+                if cols_v: strategies['Top Value (30%)'] = (1 + bt_ret[cols_v].mean(axis=1)).cumprod()
+                if cols_m: strategies['Top Momentum (40%)'] = (1 + bt_ret[cols_m].mean(axis=1)).cumprod()
+                if cols_combo: strategies['⭐ Top 5 (Sugestão)'] = (1 + bt_ret[cols_combo].mean(axis=1)).cumprod()
+                
+                df_equity = pd.DataFrame(strategies)
+                df_equity = df_equity / df_equity.iloc[0] * 100 # Base 100
+                
+                fig_bt = px.line(df_equity, title="Curva de Retorno Acumulado (Base 100)")
+                st.plotly_chart(fig_bt, use_container_width=True)
+                
+                # Métricas de Risco/Retorno
+                metrics_bt = []
+                for name, series in strategies.items():
+                    total_ret = (series.iloc[-1] / series.iloc[0]) - 1
+                    vol = series.pct_change().std() * (252**0.5)
+                    sharpe = (total_ret) / vol if vol > 0 else 0
+                    
+                    roll_max = series.cummax()
+                    drawdown = (series - roll_max) / roll_max
+                    max_dd = drawdown.min()
+                    
+                    metrics_bt.append({
+                        'Estratégia': name,
+                        'Retorno Total': f"{total_ret*100:.1f}%",
+                        'Volatilidade (aa)': f"{vol*100:.1f}%",
+                        'Sharpe': f"{sharpe:.2f}",
+                        'Max Drawdown': f"{max_dd*100:.1f}%"
+                    })
+                
+                st.table(pd.DataFrame(metrics_bt).set_index('Estratégia'))
+            else:
+                st.error("Dados históricos insuficientes para backtest.")
+
+        # === TAB 3: INSIGHTS ===
         with tab3:
             col_hm1, col_hm2 = st.columns([2, 1])
             
             with col_hm1:
-                st.subheader("Mapa de Correlação de Retornos")
-                corr = bt_ret.drop(columns=['BENCHMARK'], errors='ignore').corr()
-                fig_corr = px.imshow(corr, text_auto=True, aspect="auto", color_continuous_scale='RdBu_r')
-                st.plotly_chart(fig_corr, use_container_width=True)
+                st.subheader("Mapa de Correlação (Últimos 12m)")
+                if len(prices) > 252:
+                    recent_ret = prices.iloc[-252:].pct_change().dropna()
+                    corr = recent_ret.drop(columns=['BENCHMARK'], errors='ignore').corr()
+                    fig_corr = px.imshow(corr, text_auto=False, aspect="auto", color_continuous_scale='RdBu_r')
+                    st.plotly_chart(fig_corr, use_container_width=True)
             
             with col_hm2:
-                st.subheader("Dispersão: Valor vs Qualidade")
-                fig_scat = px.scatter(master_df, x='Value Rank', y='Quality Rank', hover_name=master_df.index, 
-                                      color='Score Geral', size='Momentum Rank', 
-                                      title="Quadrantes de Seleção")
+                st.subheader("Matriz: Valor vs Qualidade")
+                st.caption("Eixo X: Value Rank | Eixo Y: Quality Rank | Tamanho: Momentum")
+                fig_scat = px.scatter(
+                    master_df, 
+                    x='Value Rank', y='Quality Rank', 
+                    hover_name=master_df.index, 
+                    color='Score Geral', 
+                    size='Momentum Rank', 
+                    size_max=40,
+                    color_continuous_scale='Viridis'
+                )
                 fig_scat.add_hline(y=50, line_dash="dash", line_color="gray")
                 fig_scat.add_vline(x=50, line_dash="dash", line_color="gray")
                 st.plotly_chart(fig_scat, use_container_width=True)
 
 else:
-    st.info("👋 Olá! Clique no botão na barra lateral para carregar os dados e gerar o painel.")
+    st.info("👋 Bem-vindo! Clique no botão na barra lateral para iniciar a análise.")
