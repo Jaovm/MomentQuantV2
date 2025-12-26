@@ -516,11 +516,16 @@ def main():
             
             # Master DF
             final_df = pd.DataFrame(index=fundamentals.index)
-            final_df['Res_Mom'] = res_mom
-            final_df['Value'] = val_score
-            final_df['Quality'] = qual_score
-            final_df['Fund_Mom'] = fund_mom
-            final_df['Sector'] = fundamentals['sector']
+            final_df['Res_Mom'] = res_mom.reindex(fundamentals.index)
+            final_df['Value'] = val_score.reindex(fundamentals.index)
+            final_df['Quality'] = qual_score.reindex(fundamentals.index)
+            final_df['Fund_Mom'] = fund_mom.reindex(fundamentals.index)
+            
+            # Correção segura para a coluna 'sector'
+            if 'sector' in fundamentals.columns:
+                final_df['Sector'] = fundamentals['sector']
+            else:
+                final_df['Sector'] = 'Unknown'
             
             # Normalização
             cols_to_norm = ['Res_Mom', 'Value', 'Quality', 'Fund_Mom']
