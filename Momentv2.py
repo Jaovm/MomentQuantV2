@@ -1,384 +1,636 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
+import statsmodels.api as sm
 import plotly.express as px
-import plotly.graph_objects as go
-from scipy import stats
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# --- Configuração da Página ---
+# ==============================================================================
+# CONFIGURAÇÃO DA PÁGINA
+# ==============================================================================
 st.set_page_config(
-    page_title="Painel Quantitativo de Ações BR", 
+    page_title="Quant Factor Lab Pro v2",
     layout="wide",
-    page_icon="📈"
+    initial_sidebar_state="expanded"
 )
 
-# --- CSS Customizado para visual ---
-st.markdown("""
-<style>
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 15px;
-        border-radius: 10px;
-        border-left: 5px solid #ff4b4b;
-    }
-</style>
-""", unsafe_allow_html=True)
+# ==============================================================================
+# MÓDULO 1: DATA FETCHING (Busca de Dados)
+# ==============================================================================
 
-# --- 1. Definição do Universo e Inputs ---
-DEFAULT_TICKERS = [
-    'ITUB3.SA', 'TOTS3.SA', 'MDIA3.SA', 'TAEE3.SA', 'BBSE3.SA', 'WEGE3.SA', 
-    'PSSA3.SA', 'EGIE3.SA', 'B3SA3.SA', 'VIVT3.SA', 'AGRO3.SA', 'PRIO3.SA', 
-    'BBAS3.SA', 'BPAC11.SA', 'SBSP3.SA', 'SAPR4.SA', 'CMIG3.SA', 'UNIP6.SA', 'FRAS3.SA'
-]
-BENCHMARK = "^BVSP" # Ibovespa
-
-# --- 2. Funções de Coleta e Cálculo ---
-
-@st.cache_data(ttl=3600) # Cache de 1 hora
-def get_stock_data(tickers, benchmark, period="5y"):
-    """Coleta dados de preço ajustado."""
-    with st.spinner('Baixando histórico de preços...'):
-        tickers_list = tickers + [benchmark]
-        # Download otimizado
-        data = yf.download(tickers_list, period=period, group_by='ticker', auto_adjust=True, threads=True)
+@st.cache_data(ttl=3600*12)
+def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFrame:
+    """Busca histórico de preços ajustados, garantindo o benchmark BOVA11.SA."""
+    t_list = list(tickers)
+    if 'BOVA11.SA' not in t_list:
+        t_list.append('BOVA11.SA')
     
-    close_prices = pd.DataFrame()
-    for t in tickers:
-        try:
-            # Verifica se o ticker existe no dataframe baixado
-            if t in data.columns.levels[0]:
-                close_prices[t] = data[t]['Close']
-        except KeyError:
-            continue
-    
-    # Tratamento para o Benchmark
-    if benchmark in data.columns.levels[0]:
-         close_prices['BENCHMARK'] = data[benchmark]['Close']
+    try:
+        data = yf.download(
+            t_list, 
+            start=start_date, 
+            end=end_date, 
+            progress=False,
+            auto_adjust=False
+        )['Adj Close']
+        
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
             
-    return close_prices.dropna(how='all')
+        return data.dropna(how='all')
+    except Exception as e:
+        st.error(f"Erro ao baixar preços: {e}")
+        return pd.DataFrame()
 
-@st.cache_data(ttl=3600)
-def get_fundamentals(tickers):
-    """Coleta indicadores fundamentalistas (Snapshot Atual)."""
-    metrics = []
+@st.cache_data(ttl=3600*24)
+def fetch_fundamentals(tickers: list) -> pd.DataFrame:
+    """Busca snapshots fundamentais atuais com métricas expandidas para Value Composto."""
+    data = []
+    clean_tickers = [t for t in tickers if t != 'BOVA11.SA']
     
-    # Barra de progresso visual
     progress_bar = st.progress(0)
-    status_text = st.empty()
+    total = len(clean_tickers)
     
-    total = len(tickers)
-    for i, t in enumerate(tickers):
-        status_text.text(f"Baixando fundamentos: {t} ({i+1}/{total})")
+    for i, t in enumerate(clean_tickers):
         try:
-            stock = yf.Ticker(t)
-            info = stock.info
+            ticker_obj = yf.Ticker(t)
+            info = ticker_obj.info
+            sector = info.get('sector', 'Unknown')
             
-            def get_val(key):
-                val = info.get(key, np.nan)
-                return val if val is not None else np.nan
-
-            metrics.append({
-                'Ticker': t,
-                'Nome': info.get('shortName', t),
-                'Setor': info.get('sector', 'Outros'),
-                'ROE': get_val('returnOnEquity'),
-                'Margem Líquida': get_val('profitMargins'),
-                'Dívida/EBITDA': get_val('debtToEquity'), # Proxy
-                'Crescimento Lucro': get_val('earningsGrowth'),
-                'P/L': get_val('trailingPE'),
-                'P/VP': get_val('priceToBook'),
-                'EV/EBITDA': get_val('enterpriseToEbitda'),
-                'Dividend Yield': get_val('dividendYield')
+            # Fallback básico para setor
+            if sector in ['Unknown', 'N/A'] and 'longName' in info:
+                 if 'Banco' in info['longName'] or 'Financeira' in info['longName']:
+                     sector = 'Financial Services'
+            
+            # Coleta de métricas para Value Composto
+            data.append({
+                'ticker': t,
+                'sector': sector,
+                'forwardPE': info.get('forwardPE', np.nan),
+                'trailingPE': info.get('trailingPE', np.nan),
+                'priceToBook': info.get('priceToBook', np.nan),
+                'enterpriseToEbitda': info.get('enterpriseToEbitda', np.nan),
+                'freeCashflow': info.get('freeCashflow', np.nan),
+                'marketCap': info.get('marketCap', np.nan),
+                'returnOnEquity': info.get('returnOnEquity', np.nan),
+                'profitMargins': info.get('profitMargins', np.nan),
+                'debtToEquity': info.get('debtToEquity', np.nan),
+                'earningsGrowth': info.get('earningsGrowth', np.nan),
+                'revenueGrowth': info.get('revenueGrowth', np.nan)
             })
         except:
-            metrics.append({'Ticker': t})
-        
+            pass
         progress_bar.progress((i + 1) / total)
-            
-    status_text.empty()
+        
     progress_bar.empty()
+    if not data:
+        return pd.DataFrame()
     
-    df = pd.DataFrame(metrics)
-    return df.set_index('Ticker')
+    df = pd.DataFrame(data).set_index('ticker')
+    # Calcular Cash Flow Yield se possível
+    if 'freeCashflow' in df.columns and 'marketCap' in df.columns:
+        df['cashFlowYield'] = df['freeCashflow'] / df['marketCap']
+    
+    return df
 
-def calculate_residual_momentum(prices_df, lookback_months=12, exclude_recent_months=1):
-    """Calcula o Momentum Residual (Alpha ajustado)."""
-    momentum_scores = {}
-    
-    window = lookback_months * 21
-    skip = exclude_recent_months * 21
-    
-    if len(prices_df) < window + skip:
-        return pd.Series()
+# ==============================================================================
+# MÓDULO 2: CÁLCULO DE FATORES (Math & Logic)
+# ==============================================================================
 
-    recent_prices = prices_df.iloc[:-skip]
+def compute_residual_momentum(price_df: pd.DataFrame, lookback=36, skip=1) -> pd.Series:
+    """
+    Calcula Residual Momentum Clássico (Blitz et al.):
+    1. Regressão de 36 meses (lookback) vs Mercado.
+    2. Rankear pelo t-stat do intercepto ou retornos residuais.
+    3. Adiciona Volatility Scaling (Barroso-Santa-Clara).
+    """
+    df = price_df.copy()
+    monthly = df.resample('ME').last()
+    rets = monthly.pct_change().dropna()
     
-    for col in prices_df.columns:
-        if col == 'BENCHMARK': continue
+    if 'BOVA11.SA' not in rets.columns or len(rets) < lookback: 
+        return pd.Series(dtype=float)
         
-        asset_ret = recent_prices[col].pct_change().tail(window).dropna()
-        if 'BENCHMARK' not in recent_prices.columns:
-            continue
+    market = rets['BOVA11.SA']
+    scores = {}
+    vols = {}
+    
+    # Janela de regressão (ex: 36 meses)
+    # Skip de 1 mês para evitar reversão de curto prazo
+    for ticker in rets.columns:
+        if ticker == 'BOVA11.SA': continue
+        
+        # Dados para regressão (lookback meses, pulando os últimos 'skip' meses)
+        y = rets[ticker].tail(lookback + skip).iloc[:-skip]
+        x = market.tail(lookback + skip).iloc[:-skip]
+        
+        if len(y) < lookback: continue
             
-        bench_ret = recent_prices['BENCHMARK'].pct_change().tail(window).dropna()
-        
-        common_idx = asset_ret.index.intersection(bench_ret.index)
-        if len(common_idx) < window * 0.8:
-            momentum_scores[col] = np.nan
-            continue
-            
-        y = asset_ret.loc[common_idx]
-        x = bench_ret.loc[common_idx]
-        
         try:
-            slope, intercept, _, _, _ = stats.linregress(x, y)
-            expected_ret = intercept + slope * x
-            residuals = y - expected_ret
-            score = residuals.mean() / residuals.std() if residuals.std() != 0 else 0
-            momentum_scores[col] = score
-        except:
-            momentum_scores[col] = np.nan
-        
-    return pd.Series(momentum_scores, name='Residual Momentum')
-
-# --- 3. Interface do Streamlit ---
-
-st.sidebar.header("⚙️ Configurações")
-selected_tickers = st.sidebar.multiselect("Universo de Ações", DEFAULT_TICKERS, default=DEFAULT_TICKERS)
-period_input = st.sidebar.selectbox("Período de Análise", ["1y", "3y", "5y"], index=2)
-
-st.sidebar.markdown("---")
-st.sidebar.info("**Nota:** Dados obtidos via Yahoo Finance. Podem haver atrasos ou lacunas em fundamentos específicos de Small Caps.")
-
-if st.sidebar.button("🚀 Gerar Painel de Decisão"):
-    if not selected_tickers:
-        st.error("Por favor, selecione pelo menos um ativo.")
-    else:
-        # 1. Coleta de Dados
-        prices = get_stock_data(selected_tickers, BENCHMARK, period="5y")
-        df_funds = get_fundamentals(selected_tickers)
-        
-        # 2. Cálculos e Tratamento
-        df_funds['ROE'] = df_funds['ROE'].fillna(0) * 100
-        df_funds['Margem Líquida'] = df_funds['Margem Líquida'].fillna(0) * 100
-        df_funds['Dividend Yield'] = df_funds['Dividend Yield'].fillna(0) * 100
-        
-        # Inverter métricas onde "menor é melhor" para o ranking
-        df_calc = df_funds.copy()
-        
-        # Quality Score
-        q_rank = (df_calc['ROE'].rank(pct=True) + 
-                  df_calc['Margem Líquida'].rank(pct=True) + 
-                  df_calc['Crescimento Lucro'].rank(pct=True) - 
-                  df_calc['Dívida/EBITDA'].fillna(100).rank(pct=True)) 
-        
-        # Value Score (Invertendo P/L, EV/EBITDA, P/VP)
-        v_rank = (df_calc['Dividend Yield'].rank(pct=True) + 
-                  (1 - df_calc['P/L'].fillna(100).rank(pct=True)) + 
-                  (1 - df_calc['P/VP'].fillna(100).rank(pct=True)) + 
-                  (1 - df_calc['EV/EBITDA'].fillna(100).rank(pct=True)))
-        
-        # Momentum Residual
-        mom_resid = calculate_residual_momentum(prices, lookback_months=12, exclude_recent_months=1)
-        
-        # Consolidar
-        master_df = df_funds.copy()
-        master_df['Residual Momentum'] = mom_resid
-        
-        # Normalização Final (0 a 100)
-        master_df['Quality Rank'] = (q_rank.rank(pct=True) * 100).fillna(0).round(1)
-        master_df['Value Rank'] = (v_rank.rank(pct=True) * 100).fillna(0).round(1)
-        master_df['Momentum Rank'] = (master_df['Residual Momentum'].rank(pct=True) * 100).fillna(0).round(1)
-        
-        # Score Geral (Média Ponderada Igualitária)
-        master_df['Score Geral'] = ((master_df['Quality Rank'] + 
-                                     master_df['Value Rank'] + 
-                                     master_df['Momentum Rank']) / 3).round(1)
-
-        # --- Dashboard ---
-        st.title(f"📊 Painel de Decisão Quantitativa")
-        st.markdown(f"**Universo:** {len(selected_tickers)} Ativos | **Benchmark:** Ibovespa")
-        st.markdown("---")
-
-        tab1, tab2, tab3 = st.tabs(["🏆 Rankings e Sugestão de Aporte", "📈 Backtest de Estratégias", "🧠 Correlações e Insights"])
-        
-        # === TAB 1: RANKINGS E SUGESTÃO ===
-        with tab1:
-            col1, col2 = st.columns(2)
+            X = sm.add_constant(x.values)
+            model = sm.OLS(y.values, X).fit()
             
+            # Usamos o t-stat do intercepto (Alpha) como score de momentum residual
+            # Isso penaliza alphas com alta incerteza
+            scores[ticker] = model.tvalues[0]
+            
+            # Volatility Scaling: Inverso da volatilidade dos resíduos recentes (6 meses)
+            recent_resid = model.resid[-6:]
+            vol = np.std(recent_resid)
+            vols[ticker] = 1.0 / vol if vol > 0 else 0
+            
+        except:
+            scores[ticker] = 0
+            vols[ticker] = 0
+            
+    s_scores = pd.Series(scores)
+    s_vols = pd.Series(vols)
+    
+    # Escalonamento: Score * Vol_Inv
+    final_res_mom = s_scores * s_vols
+    return final_res_mom.rename('Residual_Momentum')
+
+def compute_composite_value_score(fund_df: pd.DataFrame) -> pd.Series:
+    """
+    Score de Valor Composto: Média de múltiplos normalizados.
+    Inclui: E/P (Forward & Trailing), B/P, EBITDA/EV, CashFlow Yield.
+    """
+    df = fund_df.copy()
+    val_metrics = pd.DataFrame(index=df.index)
+    
+    # Invertemos os múltiplos para que "maior é melhor" (Barato)
+    if 'forwardPE' in df: val_metrics['EP_Forward'] = np.where(df['forwardPE'] > 0, 1/df['forwardPE'], np.nan)
+    if 'trailingPE' in df: val_metrics['EP_Trailing'] = np.where(df['trailingPE'] > 0, 1/df['trailingPE'], np.nan)
+    if 'priceToBook' in df: val_metrics['BP'] = np.where(df['priceToBook'] > 0, 1/df['priceToBook'], np.nan)
+    if 'enterpriseToEbitda' in df: val_metrics['EBITDA_EV'] = np.where(df['enterpriseToEbitda'] > 0, 1/df['enterpriseToEbitda'], np.nan)
+    if 'cashFlowYield' in df: val_metrics['CF_Yield'] = df['cashFlowYield']
+    
+    # Normalizar cada métrica antes de tirar a média
+    for col in val_metrics.columns:
+        val_metrics[col] = robust_zscore(val_metrics[col])
+        
+    return val_metrics.mean(axis=1).rename("Value_Score")
+
+def compute_fundamental_momentum(fund_df: pd.DataFrame) -> pd.Series:
+    """Z-Score combinado de crescimento de Receita e Lucro."""
+    metrics = ['earningsGrowth', 'revenueGrowth']
+    temp_df = pd.DataFrame(index=fund_df.index)
+    for m in metrics:
+        if m in fund_df.columns:
+            s = fund_df[m].fillna(fund_df[m].median())
+            temp_df[m] = robust_zscore(s)
+    return temp_df.mean(axis=1).rename("Fundamental_Momentum")
+
+def compute_quality_score(fund_df: pd.DataFrame) -> pd.Series:
+    """Score de Qualidade: ROE, Margem e Alavancagem."""
+    scores = pd.DataFrame(index=fund_df.index)
+    if 'returnOnEquity' in fund_df: scores['ROE'] = fund_df['returnOnEquity']
+    if 'profitMargins' in fund_df: scores['PM'] = fund_df['profitMargins']
+    if 'debtToEquity' in fund_df: scores['DE_Inv'] = -1 * fund_df['debtToEquity']
+    
+    for col in scores.columns:
+        scores[col] = robust_zscore(scores[col])
+        
+    return scores.mean(axis=1).rename("Quality_Score")
+
+# ==============================================================================
+# MÓDULO 3: SCORING & NORMALIZAÇÃO
+# ==============================================================================
+
+def robust_zscore(series: pd.Series) -> pd.Series:
+    """Z-Score Robusto usando Mediana e MAD."""
+    series = series.replace([np.inf, -np.inf], np.nan)
+    if series.isnull().all(): return series
+    median = series.median()
+    mad = (series - median).abs().median()
+    if mad == 0 or mad < 1e-6: 
+        # Fallback para desvio padrão se MAD for zero
+        std = series.std()
+        if std == 0 or np.isnan(std): return series.fillna(0) * 0
+        return (series - median) / std
+    z = (series - median) / (mad * 1.4826) 
+    return z.clip(-3, 3) 
+
+def build_composite_score(df_master: pd.DataFrame, weights: dict) -> pd.DataFrame:
+    """Calcula score final ponderado."""
+    df = df_master.copy()
+    df['Composite_Score'] = 0.0
+    for factor_col, weight in weights.items():
+        if factor_col in df.columns:
+            df['Composite_Score'] += df[factor_col].fillna(0) * weight
+            
+    return df.sort_values('Composite_Score', ascending=False)
+
+# ==============================================================================
+# MÓDULO 4: FACTOR TIMING & PROJEÇÃO
+# ==============================================================================
+
+def analyze_factor_timing(all_prices: pd.DataFrame, all_fundamentals: pd.DataFrame, lookback_years=3):
+    """
+    Gera gráfico de performance histórica por fator.
+    Simula o retorno de cada fator isoladamente nos últimos anos.
+    """
+    end_date = all_prices.index[-1]
+    start_date = end_date - timedelta(days=lookback_years*365)
+    
+    # Resample mensal para agilizar
+    monthly_prices = all_prices.loc[start_date:end_date].resample('ME').last()
+    monthly_rets = monthly_prices.pct_change().dropna()
+    
+    factor_performances = {}
+    
+    # Fatores para testar
+    factors = {
+        'Residual_Momentum': lambda p: compute_residual_momentum(p),
+        'Value': lambda p: compute_composite_value_score(all_fundamentals),
+        'Quality': lambda p: compute_quality_score(all_fundamentals),
+        'Fund_Momentum': lambda p: compute_fundamental_momentum(all_fundamentals)
+    }
+    
+    # Simplificação: Calculamos os scores uma vez (atuais) e vemos como esses ativos performaram
+    # Para um Factor Timing real, precisaríamos de dados fundamentais históricos (Point-in-Time),
+    # mas como o yfinance só dá o snapshot atual, simularemos a performance recente dos top picks atuais de cada fator.
+    
+    for f_name, f_func in factors.items():
+        try:
+            if f_name == 'Residual_Momentum':
+                scores = f_func(all_prices.loc[:end_date])
+            else:
+                scores = f_func(None)
+            
+            top_tickers = scores.sort_values(ascending=False).head(10).index.tolist()
+            valid_tickers = [t for t in top_tickers if t in monthly_rets.columns]
+            
+            if valid_tickers:
+                # Retorno médio equiponderado dos top picks deste fator
+                factor_rets = monthly_rets[valid_tickers].mean(axis=1)
+                factor_performances[f_name] = (1 + factor_rets).cumprod()
+        except:
+            continue
+            
+    if 'BOVA11.SA' in monthly_rets.columns:
+        factor_performances['Benchmark'] = (1 + monthly_rets['BOVA11.SA']).cumprod()
+        
+    return pd.DataFrame(factor_performances)
+
+def project_dca_future(current_balance: float, monthly_deposit: float, years: int, expected_return: float):
+    """
+    Projeção de patrimônio futuro.
+    """
+    months = years * 12
+    monthly_ret = (1 + expected_return) ** (1/12) - 1
+    
+    balances = []
+    balance = current_balance
+    for m in range(months + 1):
+        balances.append(balance)
+        balance = balance * (1 + monthly_ret) + monthly_deposit
+        
+    return pd.Series(balances)
+
+# (Restante do código de backtest e interface será adaptado na Fase 4)
+
+def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame, top_n: int, vol_target: float = None):
+    """Define pesos do portfólio e ordena do maior para o menor peso."""
+    selected = ranked_df.head(top_n).index.tolist()
+    if not selected: return pd.Series()
+
+    if vol_target is not None:
+        recent_rets = prices[selected].pct_change().tail(63)
+        vols = recent_rets.std() * (252**0.5)
+        vols[vols == 0] = 1e-6 
+        raw_weights_inv = 1 / vols
+        weights = raw_weights_inv / raw_weights_inv.sum() 
+    else:
+        weights = pd.Series(1.0/len(selected), index=selected)
+        
+    return weights.sort_values(ascending=False)
+
+def run_dynamic_backtest(
+    all_prices: pd.DataFrame, 
+    all_fundamentals: pd.DataFrame, 
+    weights_config: dict, 
+    top_n: int, 
+    use_vol_target: bool,
+    use_sector_neutrality: bool,
+    start_date_backtest: datetime
+):
+    """Executa um backtest mês a mês (Walk-Forward)."""
+    end_date = all_prices.index[-1]
+    subset_prices = all_prices.loc[start_date_backtest - timedelta(days=400):end_date]
+    rebalance_dates = subset_prices.loc[start_date_backtest:end_date].resample('MS').first().index.tolist()
+    
+    if not rebalance_dates:
+        return pd.DataFrame()
+
+    strategy_daily_rets = []
+    benchmark_daily_rets = []
+
+    for i, rebal_date in enumerate(rebalance_dates):
+        next_date = rebalance_dates[i+1] if i < len(rebalance_dates) - 1 else end_date
+        prices_historical = subset_prices.loc[:rebal_date]
+        mom_window = prices_historical.tail(400) 
+        risk_window = prices_historical.tail(90)
+        
+        # Cálculo dos fatores com as novas melhorias
+        res_mom = compute_residual_momentum(mom_window)
+        fund_mom = compute_fundamental_momentum(all_fundamentals)
+        val_score = compute_composite_value_score(all_fundamentals)
+        qual_score = compute_quality_score(all_fundamentals)
+        
+        df_period = pd.DataFrame(index=all_prices.columns.drop('BOVA11.SA', errors='ignore'))
+        df_period['Res_Mom'] = res_mom
+        df_period['Fund_Mom'] = fund_mom
+        df_period['Value'] = val_score
+        df_period['Quality'] = qual_score
+        
+        if 'sector' in all_fundamentals.columns: 
+             df_period['Sector'] = all_fundamentals['sector']
+        
+        df_period.dropna(thresh=2, inplace=True)
+        norm_cols = ['Res_Mom', 'Fund_Mom', 'Value', 'Quality']
+        w_keys = {}
+        
+        if use_sector_neutrality and 'Sector' in df_period.columns and df_period['Sector'].nunique() > 1:
+            for c in norm_cols:
+                if c in df_period.columns:
+                    new_col = f"{c}_Z"
+                    df_period[new_col] = df_period.groupby('Sector')[c].transform(
+                         lambda x: robust_zscore(x) if len(x) > 1 else x - x.median()
+                    )
+                    w_keys[new_col] = weights_config.get(c, 0.0)
+        else:
+            for c in norm_cols:
+                if c in df_period.columns:
+                    new_col = f"{c}_Z"
+                    df_period[new_col] = robust_zscore(df_period[c])
+                    w_keys[new_col] = weights_config.get(c, 0.0)
+                    
+        ranked_period = build_composite_score(df_period, w_keys)
+        current_weights = construct_portfolio(ranked_period, risk_window, top_n, 0.15 if use_vol_target else None)
+        
+        market_period = subset_prices.loc[rebal_date:next_date].iloc[1:] 
+        period_pct = market_period.pct_change().dropna()
+        if period_pct.empty: continue
+            
+        valid_tickers = [t for t in current_weights.index if t in period_pct.columns]
+        if valid_tickers:
+            strat_rets = (period_pct[valid_tickers] * current_weights[valid_tickers]).sum(axis=1)
+            strategy_daily_rets.append(strat_rets)
+            if 'BOVA11.SA' in period_pct.columns:
+                benchmark_daily_rets.append(period_pct['BOVA11.SA'])
+
+    if not strategy_daily_rets: return pd.DataFrame()
+    
+    final_strat = pd.concat(strategy_daily_rets)
+    final_bench = pd.concat(benchmark_daily_rets)
+    
+    df_backtest = pd.DataFrame({
+        'Strategy': (1 + final_strat).cumprod(),
+        'BOVA11.SA': (1 + final_bench).cumprod()
+    })
+    return df_backtest
+
+def run_dca_simulation(backtest_df: pd.DataFrame, monthly_investment: float):
+    """Simula evolução patrimonial com aportes mensais."""
+    if backtest_df.empty: return pd.DataFrame(), pd.DataFrame(), {}
+    
+    # Pegar datas de aporte (primeiro dia útil de cada mês)
+    dca_dates = backtest_df.resample('MS').first().index
+    
+    strategy_returns = backtest_df['Strategy'].pct_change().fillna(0)
+    benchmark_returns = backtest_df['BOVA11.SA'].pct_change().fillna(0)
+    
+    strat_balance = 0
+    bench_balance = 0
+    
+    strat_history = []
+    bench_history = []
+    transactions = []
+    
+    for date in backtest_df.index:
+        # Aplicar retorno do dia
+        strat_balance *= (1 + strategy_returns.loc[date])
+        bench_balance *= (1 + benchmark_returns.loc[date])
+        
+        # Se for dia de aporte
+        if date in dca_dates:
+            strat_balance += monthly_investment
+            bench_balance += monthly_investment
+            transactions.append({'Date': date, 'Amount': monthly_investment})
+            
+        strat_history.append(strat_balance)
+        bench_history.append(bench_balance)
+        
+    dca_curve = pd.DataFrame({
+        'Strategy_DCA': strat_history,
+        'BOVA11.SA_DCA': bench_history
+    }, index=backtest_df.index)
+    
+    return dca_curve, pd.DataFrame(transactions), {}
+
+# ==============================================================================
+# MÓDULO 5: INTERFACE (Streamlit)
+# ==============================================================================
+
+def main():
+    # Custom CSS para melhorar o visual
+    st.markdown("""
+        <style>
+        .main {
+            background-color: #f5f7f9;
+        }
+        .stMetric {
+            background-color: #ffffff;
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 24px;
+        }
+        .stTabs [data-baseweb="tab"] {
+            height: 50px;
+            white-space: pre-wrap;
+            background-color: #ffffff;
+            border-radius: 4px 4px 0px 0px;
+            gap: 1px;
+            padding-top: 10px;
+            padding-bottom: 10px;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.title("🚀 Quant Factor Lab Pro v2")
+    st.markdown("### Sistema Quantitativo de Seleção de Ativos")
+    st.info("Esta ferramenta utiliza modelos de **Residual Momentum** (Blitz et al.) e **Value Composto** para identificar as melhores oportunidades no mercado brasileiro.")
+
+    with st.sidebar:
+        st.image("https://cdn-icons-png.flaticon.com/512/2620/2620582.png", width=100)
+        st.header("⚙️ Painel de Controle")
+        
+        universe_option = st.selectbox("Universo de Ativos", ["Ibovespa (Top 50)", "Personalizado"])
+        if universe_option == "Ibovespa (Top 50)":
+            tickers = [
+                'VALE3.SA', 'PETR4.SA', 'ITUB4.SA', 'BBDC4.SA', 'ABEV3.SA', 'BBAS3.SA', 'B3SA3.SA', 'WEGE3.SA',
+                'RENT3.SA', 'SUZB3.SA', 'GGBR4.SA', 'ITSA4.SA', 'JBSS3.SA', 'RDOR3.SA', 'RAIL3.SA', 'EQTL3.SA',
+                'CSAN3.SA', 'VIVT3.SA', 'LREN3.SA', 'PRIO3.SA', 'RADL3.SA', 'HAPV3.SA', 'BPAC11.SA', 'ELET3.SA',
+                'VBBR3.SA', 'SBSP3.SA', 'CCRO3.SA', 'CMIG4.SA', 'HYPE3.SA', 'CPLE6.SA', 'UGPA3.SA', 'SANB11.SA',
+                'EGIE3.SA', 'TOTS3.SA', 'TRPL4.SA', 'CSNA3.SA', 'ENEV3.SA', 'GOAU4.SA', 'CYRE3.SA', 'BRFS3.SA',
+                'ALOS3.SA', 'MULT3.SA', 'CRFB3.SA', 'TIMS3.SA', 'EMBR3.SA', 'CPFE3.SA', 'MRVE3.SA', 'CIEL3.SA',
+                'BRKM5.SA', 'AZUL4.SA'
+            ]
+        else:
+            tickers_input = st.text_area("Tickers (separados por vírgula)", "VALE3.SA, PETR4.SA, ITUB4.SA")
+            tickers = [t.strip() for t in tickers_input.split(",")]
+
+        st.subheader("Pesos dos Fatores")
+        w_res_mom = st.slider("Residual Momentum", 0.0, 1.0, 0.4)
+        w_val = st.slider("Value Composto", 0.0, 1.0, 0.3)
+        w_qual = st.slider("Quality", 0.0, 1.0, 0.2)
+        w_fund_mom = st.slider("Fundamental Momentum", 0.0, 1.0, 0.1)
+        
+        st.subheader("Parâmetros DCA")
+        dca_amount = st.number_input("Aporte Mensal (R$)", 100, 100000, 1000)
+        dca_years_proj = st.slider("Anos para Projeção", 1, 30, 10)
+        
+        st.subheader("Backtest")
+        top_n = st.number_input("Top N Ativos", 3, 20, 5)
+        use_vol_target = st.checkbox("Volatility Scaling (Portfólio)", True)
+        use_sector_neutrality = st.checkbox("Neutralidade Setorial", True)
+
+    if st.button("🚀 Executar Análise"):
+        with st.status("Processando dados...", expanded=True) as status:
+            st.write("Buscando preços...")
+            prices = fetch_price_data(tickers, "2018-01-01", datetime.now().strftime("%Y-%m-%d"))
+            
+            st.write("Buscando fundamentos...")
+            fundamentals = fetch_fundamentals(tickers)
+            
+            st.write("Calculando fatores...")
+            res_mom = compute_residual_momentum(prices)
+            val_score = compute_composite_value_score(fundamentals)
+            qual_score = compute_quality_score(fundamentals)
+            fund_mom = compute_fundamental_momentum(fundamentals)
+            
+            # Master DF
+            final_df = pd.DataFrame(index=fundamentals.index)
+            final_df['Res_Mom'] = res_mom
+            final_df['Value'] = val_score
+            final_df['Quality'] = qual_score
+            final_df['Fund_Mom'] = fund_mom
+            final_df['Sector'] = fundamentals['sector']
+            
+            # Normalização
+            cols_to_norm = ['Res_Mom', 'Value', 'Quality', 'Fund_Mom']
+            for c in cols_to_norm:
+                final_df[f"{c}_Z"] = robust_zscore(final_df[c])
+            
+            weights_config = {
+                'Res_Mom_Z': w_res_mom,
+                'Value_Z': w_val,
+                'Quality_Z': w_qual,
+                'Fund_Mom_Z': w_fund_mom
+            }
+            
+            ranked_df = build_composite_score(final_df, weights_config)
+            
+            st.write("Executando Backtest...")
+            backtest_1yr = run_dynamic_backtest(prices, fundamentals, {k.replace('_Z', ''): v for k, v in weights_config.items()}, top_n, use_vol_target, use_sector_neutrality, datetime.now() - timedelta(days=365))
+            
+            st.write("Simulando DCA...")
+            dca_curve, dca_trans, _ = run_dca_simulation(backtest_1yr, dca_amount)
+            
+            st.write("Analisando Factor Timing...")
+            timing_df = analyze_factor_timing(prices, fundamentals)
+            
+            status.update(label="Análise Concluída!", state="complete", expanded=False)
+
+        # --- TABS ---
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard Principal", "📈 Factor Timing", "🔮 Projeção DCA", "🔍 Detalhes Técnicos"])
+        
+        with tab1:
+            # Métricas de Resumo
+            m1, m2, m3, m4 = st.columns(4)
+            if not backtest_1yr.empty:
+                ret_12m = backtest_1yr['Strategy'].iloc[-1] - 1
+                bench_12m = backtest_1yr['BOVA11.SA'].iloc[-1] - 1
+                m1.metric("Retorno Estratégia (12m)", f"{ret_12m:.2%}", delta=f"{(ret_12m - bench_12m):.2%} vs Bench")
+                
+                daily_rets = backtest_1yr['Strategy'].pct_change().dropna()
+                vol_ann = daily_rets.std() * (252**0.5)
+                m2.metric("Volatilidade Anualizada", f"{vol_ann:.2%}")
+                
+                sharpe = (ret_12m - 0.10) / vol_ann if vol_ann > 0 else 0
+                m3.metric("Sharpe Ratio", f"{sharpe:.2f}")
+                
+                m4.metric("Ativos Selecionados", f"{top_n}")
+
+            st.markdown("---")
+            
+            col1, col2 = st.columns([3, 2])
             with col1:
-                st.subheader("Top Picks (Score Global)")
-                st.caption("Média de Qualidade, Valor e Momentum")
-                top_picks = master_df.sort_values(by='Score Geral', ascending=False).head(10)
-                st.dataframe(
-                    top_picks[['Score Geral', 'Quality Rank', 'Value Rank', 'Momentum Rank']]
-                    .style.background_gradient(cmap='Blues'), 
-                    use_container_width=True
-                )
+                st.subheader("🏆 Top Picks (Ranking de Fatores)")
+                # Formatação amigável da tabela
+                display_ranked = ranked_df[['Composite_Score', 'Sector', 'Res_Mom', 'Value', 'Quality']].head(top_n).copy()
+                display_ranked.columns = ['Score Final', 'Setor', 'Momentum Residual', 'Valor Composto', 'Qualidade']
+                st.dataframe(display_ranked.style.background_gradient(cmap='RdYlGn', subset=['Score Final']), use_container_width=True, height=400)
+                
+                if not backtest_1yr.empty:
+                    st.subheader("📈 Curva de Equidade (Últimos 12 Meses)")
+                    fig_perf = px.line(backtest_1yr, labels={'value': 'Retorno Acumulado', 'Date': 'Data'}, color_discrete_map={'Strategy': '#00CC96', 'BOVA11.SA': '#EF553B'})
+                    fig_perf.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                    st.plotly_chart(fig_perf, use_container_width=True)
             
             with col2:
-                st.subheader("Indicadores Fundamentais")
-                st.caption("Visão bruta dos dados coletados")
-                st.dataframe(master_df[['P/L', 'ROE', 'Dividend Yield', 'Residual Momentum']].style.format("{:.2f}"), use_container_width=True)
-            
-            # KPI Cards
-            st.markdown("##### Líderes por Fator")
-            c1, c2, c3 = st.columns(3)
-            try:
-                top_q = master_df.sort_values(by='Quality Rank', ascending=False).index[0]
-                top_v = master_df.sort_values(by='Value Rank', ascending=False).index[0]
-                top_m = master_df.sort_values(by='Momentum Rank', ascending=False).index[0]
-                c1.info(f"💎 **Top Quality:** {top_q}")
-                c2.success(f"💰 **Top Value:** {top_v}")
-                c3.warning(f"🚀 **Top Momentum:** {top_m}")
-            except:
-                pass
-
-            # --- SEÇÃO DE SUGESTÃO DE APORTE ---
-            st.markdown("---")
-            st.header("💰 Sugestão de Aporte Inteligente (Mês Atual)")
-            st.markdown("""
-            Abaixo apresentamos uma carteira sugerida para novos aportes, baseada no **Smart Beta**. 
-            O peso é calculado proporcionalmente ao *Score Geral* dos Top 5 ativos.
-            """)
-
-            # Lógica
-            top_n = 5
-            suggestion_df = master_df.sort_values(by='Score Geral', ascending=False).head(top_n).copy()
-            
-            if not suggestion_df.empty:
-                total_score = suggestion_df['Score Geral'].sum()
-                suggestion_df['Peso Ideal (%)'] = (suggestion_df['Score Geral'] / total_score * 100).round(1)
+                st.subheader("💼 Alocação da Carteira")
+                weights = construct_portfolio(ranked_df, prices.tail(90), top_n, 0.15 if use_vol_target else None)
                 
-                # Identificar Driver
-                def identify_driver(row):
-                    factors = {
-                        '💎 Quality': row['Quality Rank'], 
-                        '💰 Value': row['Value Rank'], 
-                        '🚀 Momentum': row['Momentum Rank']
-                    }
-                    return max(factors, key=factors.get)
-
-                suggestion_df['Fator Dominante'] = suggestion_df.apply(identify_driver, axis=1)
+                # Tabela de Rebalanceamento
+                latest_prices = prices.iloc[-1]
+                rebal_df = pd.DataFrame(index=weights.index)
+                rebal_df['Peso'] = weights.values
+                rebal_df['Preço'] = latest_prices.reindex(weights.index).values
+                rebal_df['Alocação (R$)'] = rebal_df['Peso'] * dca_amount
+                rebal_df['Qtd. Sugerida'] = (rebal_df['Alocação (R$)'] / rebal_df['Preço']).round(0)
                 
-                col_sug_1, col_sug_2 = st.columns([1, 2])
+                st.table(rebal_df[['Peso', 'Preço', 'Qtd. Sugerida']].style.format({'Peso': '{:.1%}', 'Preço': 'R$ {:.2f}', 'Qtd. Sugerida': '{:.0f}'}))
                 
-                with col_sug_1:
-                    best_asset = suggestion_df.iloc[0]
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h3>⭐ Destaque do Mês: {best_asset.name}</h3>
-                        <h1>{best_asset['Peso Ideal (%)']}% <span style='font-size:16px'>de alocação</span></h1>
-                        <p><b>Score Geral:</b> {best_asset['Score Geral']}</p>
-                        <p><b>Fator Dominante:</b> {best_asset['Fator Dominante']}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                with col_sug_2:
-                    st.subheader("Carteira de Aporte Sugerida")
-                    st.dataframe(
-                        suggestion_df[['Peso Ideal (%)', 'Fator Dominante', 'Score Geral', 'P/L', 'Dividend Yield']]
-                        .style.background_gradient(subset=['Peso Ideal (%)'], cmap='Greens')
-                        .format("{:.1f}", subset=['Score Geral', 'Peso Ideal (%)', 'Dividend Yield'])
-                        .format("{:.1f}x", subset=['P/L']),
-                        use_container_width=True
-                    )
-            else:
-                st.warning("Dados insuficientes para gerar sugestão.")
+                fig_pie = px.pie(values=weights.values, names=weights.index, hole=0.5, color_discrete_sequence=px.colors.qualitative.Pastel)
+                fig_pie.update_layout(showlegend=True, legend=dict(orientation="h"))
+                st.plotly_chart(fig_pie, use_container_width=True)
 
-        # === TAB 2: BACKTEST ===
         with tab2:
-            st.markdown(f"#### Performance Histórica Simulada ({period_input})")
-            
-            days_map = {"1y": 252, "3y": 252*3, "5y": 252*5}
-            lookback = days_map.get(period_input, 252)
-            
-            if len(prices) > 20:
-                bt_prices = prices.iloc[-lookback:].copy()
-                bt_ret = bt_prices.pct_change().dropna()
-                
-                # Definição das Carteiras Teóricas (Viés de Look-ahead para análise de fator atual)
-                top_q_idx = master_df.sort_values('Quality Rank', ascending=False).head(int(len(master_df)*0.3)).index
-                top_v_idx = master_df.sort_values('Value Rank', ascending=False).head(int(len(master_df)*0.3)).index
-                top_m_idx = master_df.sort_values('Momentum Rank', ascending=False).head(int(len(master_df)*0.4)).index
-                top_combo_idx = master_df.sort_values('Score Geral', ascending=False).head(5).index
-                
-                # Filtrar apenas colunas que existem no bt_ret
-                def get_valid_cols(indices, df_ret):
-                    return [c for c in indices if c in df_ret.columns]
-
-                strategies = {}
-                if 'BENCHMARK' in bt_ret.columns:
-                    strategies['Ibovespa'] = (1 + bt_ret['BENCHMARK']).cumprod()
-                
-                cols_q = get_valid_cols(top_q_idx, bt_ret)
-                cols_v = get_valid_cols(top_v_idx, bt_ret)
-                cols_m = get_valid_cols(top_m_idx, bt_ret)
-                cols_combo = get_valid_cols(top_combo_idx, bt_ret)
-                
-                if cols_q: strategies['Top Quality (30%)'] = (1 + bt_ret[cols_q].mean(axis=1)).cumprod()
-                if cols_v: strategies['Top Value (30%)'] = (1 + bt_ret[cols_v].mean(axis=1)).cumprod()
-                if cols_m: strategies['Top Momentum (40%)'] = (1 + bt_ret[cols_m].mean(axis=1)).cumprod()
-                if cols_combo: strategies['⭐ Top 5 (Sugestão)'] = (1 + bt_ret[cols_combo].mean(axis=1)).cumprod()
-                
-                df_equity = pd.DataFrame(strategies)
-                df_equity = df_equity / df_equity.iloc[0] * 100 # Base 100
-                
-                fig_bt = px.line(df_equity, title="Curva de Retorno Acumulado (Base 100)")
-                st.plotly_chart(fig_bt, use_container_width=True)
-                
-                # Métricas de Risco/Retorno
-                metrics_bt = []
-                for name, series in strategies.items():
-                    total_ret = (series.iloc[-1] / series.iloc[0]) - 1
-                    vol = series.pct_change().std() * (252**0.5)
-                    sharpe = (total_ret) / vol if vol > 0 else 0
-                    
-                    roll_max = series.cummax()
-                    drawdown = (series - roll_max) / roll_max
-                    max_dd = drawdown.min()
-                    
-                    metrics_bt.append({
-                        'Estratégia': name,
-                        'Retorno Total': f"{total_ret*100:.1f}%",
-                        'Volatilidade (aa)': f"{vol*100:.1f}%",
-                        'Sharpe': f"{sharpe:.2f}",
-                        'Max Drawdown': f"{max_dd*100:.1f}%"
-                    })
-                
-                st.table(pd.DataFrame(metrics_bt).set_index('Estratégia'))
+            st.subheader("Factor Timing: Performance Histórica por Fator")
+            st.markdown("Este gráfico mostra como os ativos que hoje são 'Top Picks' de cada fator performaram nos últimos 3 anos.")
+            if not timing_df.empty:
+                st.plotly_chart(px.line(timing_df, title="Evolução dos Fatores (Base 1.0)"), use_container_width=True)
             else:
-                st.error("Dados históricos insuficientes para backtest.")
+                st.warning("Dados insuficientes para análise de timing.")
 
-        # === TAB 3: INSIGHTS ===
         with tab3:
-            col_hm1, col_hm2 = st.columns([2, 1])
+            st.subheader("Projeção de Patrimônio Futuro")
+            avg_annual_ret = (backtest_1yr['Strategy'].iloc[-1] ** (1)) - 1 if not backtest_1yr.empty else 0.15
             
-            with col_hm1:
-                st.subheader("Mapa de Correlação (Últimos 12m)")
-                if len(prices) > 252:
-                    recent_ret = prices.iloc[-252:].pct_change().dropna()
-                    corr = recent_ret.drop(columns=['BENCHMARK'], errors='ignore').corr()
-                    fig_corr = px.imshow(corr, text_auto=False, aspect="auto", color_continuous_scale='RdBu_r')
-                    st.plotly_chart(fig_corr, use_container_width=True)
+            c1, c2, c3 = st.columns(3)
+            exp_ret = c1.slider("Retorno Esperado Anual (%)", 0.0, 40.0, float(avg_annual_ret * 100)) / 100
+            proj_years = c2.number_input("Anos de Projeção", 1, 50, dca_years_proj)
+            init_bal = c3.number_input("Saldo Inicial (R$)", 0, 1000000, 0)
             
-            with col_hm2:
-                st.subheader("Matriz: Valor vs Qualidade")
-                st.caption("Eixo X: Value Rank | Eixo Y: Quality Rank | Tamanho: Momentum")
-                fig_scat = px.scatter(
-                    master_df, 
-                    x='Value Rank', y='Quality Rank', 
-                    hover_name=master_df.index, 
-                    color='Score Geral', 
-                    size='Momentum Rank', 
-                    size_max=40,
-                    color_continuous_scale='Viridis'
-                )
-                fig_scat.add_hline(y=50, line_dash="dash", line_color="gray")
-                fig_scat.add_vline(x=50, line_dash="dash", line_color="gray")
-                st.plotly_chart(fig_scat, use_container_width=True)
+            projection = project_dca_future(init_bal, dca_amount, proj_years, exp_ret)
+            
+            fig_proj = px.area(projection, title=f"Projeção em {proj_years} anos (R$ {projection.iloc[-1]:,.2f})")
+            fig_proj.update_layout(showlegend=False, yaxis_title="Patrimônio (R$)", xaxis_title="Meses")
+            st.plotly_chart(fig_proj, use_container_width=True)
+            
+            st.info(f"Com um aporte de R$ {dca_amount:,.2f} e retorno de {exp_ret:.2%}, seu patrimônio estimado será de R$ {projection.iloc[-1]:,.2f}")
 
-else:
-    st.info("👋 Bem-vindo! Clique no botão na barra lateral para iniciar a análise.")
+        with tab4:
+            st.subheader("Dados Brutos e Correlação")
+            corr = final_df[['Res_Mom', 'Value', 'Quality', 'Fund_Mom']].corr()
+            st.plotly_chart(px.imshow(corr, text_auto=True, color_continuous_scale='RdBu_r'), use_container_width=True)
+            st.dataframe(fundamentals)
+
+if __name__ == "__main__":
+    main()
