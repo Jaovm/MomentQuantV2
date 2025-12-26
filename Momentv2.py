@@ -651,32 +651,131 @@ def main():
             "🔍 Dados Brutos"
         ])
 
-        with tab1:
+                with tab1:
             # Indicadores de Regime
-            st.subheader("Bússola de Mercado")
+            st.subheader("📊 Bússola de Mercado Atual")
             breadth, total_tickers = calculate_market_breadth(prices, 'BOVA11.SA')
             
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Market Breadth (>MM200)", f"{breadth:.1%}", f"{total_tickers} ativos")
+            col_b1, col_b2, col_b3 = st.columns(3)
+            col_b1.metric("Market Breadth", f"{breadth:.1%}", delta=f"{total_tickers} ativos analisados")
             
-            # Fator Vencedor (6 Meses)
             if not factor_timing_df.empty:
-                last_6m = factor_timing_df.iloc[-1] / factor_timing_df.iloc[-126] - 1
-                winner = last_6m.idxmax()
-                c2.metric("Fator Dominante (6m)", winner, f"{last_6m.max():.2%} ret")
+                try:
+                    last_6m = factor_timing_df.iloc[-1] / factor_timing_df.iloc[-126] - 1
+                    winner = last_6m.idxmax()
+                    col_b2.metric("Fator Dominante (6 meses)", winner, f"{last_6m.max():.1%}")
+                except:
+                    col_b2.metric("Fator Dominante (6 meses)", "N/A", "")
             
-            current_top = final_df.head(top_n)
-            st.markdown("---")
-            st.subheader("Carteira Sugerida Hoje")
-            
-            # Tratamento defensivo para exibição
-            cols_to_show = ['Composite_Score']
-            if 'Sector' in current_top.columns: cols_to_show.append('Sector')
-            if 'currentPrice' in current_top.columns: cols_to_show.append('currentPrice')
-            cols_to_show += list(weights_keys.keys())
-            
-            st.dataframe(current_top[cols_to_show].style.background_gradient(cmap='RdYlGn', subset=['Composite_Score']))
+            # Última atualização
+            last_update = prices.index[-1].strftime("%d/%m/%Y")
+            col_b3.metric("Última Atualização", last_update)
 
+            st.markdown("---")
+            
+            # ============================================================
+            # CARTEIRA SUGERIDA HOJE - APRESENTAÇÃO PROFISSIONAL
+            # ============================================================
+            st.subheader("💼 Carteira Sugerida Hoje (Baseado no Score Composto)")
+            
+            current_top = final_df.head(top_n).copy()
+            
+            if current_top.empty:
+                st.warning("Nenhum ativo qualificado com os filtros atuais.")
+            else:
+                # Pega preços atuais
+                latest_prices = prices.iloc[-1]
+                current_top['Preço Atual'] = latest_prices.reindex(current_top.index)
+                
+                # Calcula pesos sugeridos (com ou sem risk parity)
+                suggested_weights = construct_portfolio(final_df, prices, top_n, 0.15 if use_vol_target else None)
+                current_top['Peso Sugerido (%)'] = suggested_weights.reindex(current_top.index) * 100
+                
+                # Arredonda e formata
+                current_top['Peso Sugerido (%)'] = current_top['Peso Sugerido (%)'].round(1)
+                current_top['Preço Atual'] = current_top['Preço Atual'].round(2)
+                
+                # Calcula alocação em R$ com base no aporte mensal (exemplo prático)
+                current_top['Alocação R$ (ex: R$ 2.000)'] = (current_top['Peso Sugerido (%)'] / 100 * dca_amount).round(0)
+                current_top['Qtd. Aprox'] = (current_top['Alocação R$ (ex: R$ 2.000)'] / current_top['Preço Atual']).round(0)
+                
+                # Colunas para exibição bonita
+                display_cols = ['Peso Sugerido (%)', 'Preço Atual', 'Alocação R$ (ex: R$ 2.000)', 'Qtd. Aprox']
+                if 'Sector' in current_top.columns:
+                    display_cols = ['Sector'] + display_cols
+                if 'currentPrice' in current_top.columns:
+                    current_top['Preço Atual'] = current_top['Preço Atual'].fillna(current_top['currentPrice'])
+                
+                # Tabela principal estilizada
+                styled_df = current_top[display_cols + ['Composite_Score']].copy()
+                
+                # Formatação
+                styled_df['Peso Sugerido (%)'] = styled_df['Peso Sugerido (%)'].map("{:.1f}%".format)
+                styled_df['Preço Atual'] = styled_df['Preço Atual'].map("R$ {:,.2f}".format)
+                styled_df['Alocação R$ (ex: R$ 2.000)'] = styled_df['Alocação R$ (ex: R$ 2.000)'].map("R$ {:,.0f}".format)
+                styled_df['Qtd. Aprox'] = styled_df['Qtd. Aprox'].astype(int)
+                styled_df['Composite_Score'] = styled_df['Composite_Score'].round(3)
+                
+                # Renomeia para exibição
+                rename_map = {
+                    'Peso Sugerido (%)': 'Peso Sugerido',
+                    'Preço Atual': 'Preço Atual',
+                    'Alocação R$ (ex: R$ 2.000)': f'Alocação (R$ {dca_amount:,.0f})',
+                    'Qtd. Aprox': 'Qtd. Aprox',
+                    'Composite_Score': 'Score Composto',
+                    'Sector': 'Setor'
+                }
+                styled_df = styled_df.rename(columns=rename_map)
+                
+                # Ordem final
+                final_display_cols = [rename_map.get(c, c) for c in display_cols] + ['Score Composto']
+                
+                st.dataframe(
+                    styled_df[final_display_cols]
+                        .sort_values('Peso Sugerido', ascending=False)
+                        .style.background_gradient(subset=['Score Composto'], cmap='RdYlGn')
+                        .bar(subset=['Peso Sugerido'], color='#00CC96'),
+                    use_container_width=True,
+                    height=400
+                )
+                
+                # Gráficos visuais
+                col_pie, col_bar = st.columns([1, 2])
+                
+                with col_pie:
+                    fig_pie = px.pie(
+                        values=suggested_weights.values,
+                        names=suggested_weights.index,
+                        title="Distribuição Teórica da Carteira",
+                        hole=0.4,
+                        color_discrete_sequence=px.colors.sequential.Greens_r
+                    )
+                    fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                
+                with col_bar:
+                    weight_df = suggested_weights.to_frame('Peso (%)').sort_values('Peso (%)', ascending=True)
+                    weight_df['Peso (%)'] = weight_df['Peso (%)'] * 100
+                    fig_bar = px.bar(
+                        weight_df,
+                        x='Peso (%)',
+                        y=weight_df.index,
+                        orientation='h',
+                        title="Pesos por Ativo",
+                        text='Peso (%)',
+                        color='Peso (%)',
+                        color_continuous_scale='Greens'
+                    )
+                    fig_bar.update_traces(texttemplate='%{text:.1f}%', textposition='inside')
+                    fig_bar.update_layout(showlegend=False, height=400)
+                    st.plotly_chart(fig_bar, use_container_width=True)
+                
+                # Dica prática
+                st.caption(
+                    f"💡 Sugestão prática: A cada aporte mensal de R$ {dca_amount:,.0f}, "
+                    f"compre aproximadamente as quantidades indicadas acima. "
+                    f"Rebalanceie trimestralmente ou quando algum ativo desviar >5% do peso alvo."
+                )
         with tab2:
             st.subheader(f"Análise de Risco ({dca_years} Anos)")
             if not backtest_dynamic.empty:
