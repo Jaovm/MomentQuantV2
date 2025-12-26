@@ -587,18 +587,18 @@ def main():
 
         with st.status("Processando Dados...", expanded=True) as status:
             end_date = datetime.now()
-            start_date_total = end_date - timedelta(days=365 * (dca_years + 3)) 
+            start_date_total = end_date - timedelta(days=365 * (dca_years + 3))
             start_date_dca = end_date - timedelta(days=365 * dca_years)
 
             # 1. Dados
             prices = fetch_price_data(tickers, start_date_total, end_date)
-            fundamentals = fetch_fundamentals(tickers) 
-            
+            fundamentals = fetch_fundamentals(tickers)
+
             if prices.empty or fundamentals.empty:
                 st.error("Falha fatal na obtenção de dados. Verifique os tickers.")
                 status.update(label="Erro!", state="error")
                 return
-            
+
             # 2. Score Atual
             res_mom = compute_residual_momentum_enhanced(prices)
             val_score = compute_value_robust(fundamentals)
@@ -608,17 +608,14 @@ def main():
             df_master['Res_Mom'] = res_mom
             df_master['Value'] = val_score
             df_master['Quality'] = qual_score
-            
-            # --- CORREÇÃO APLICADA AQUI ---
-            if 'sector' in fundamentals.columns: 
+
+            if 'sector' in fundamentals.columns:
                 df_master['Sector'] = fundamentals['sector']
-            
             if 'currentPrice' in fundamentals.columns:
                 df_master['currentPrice'] = fundamentals['currentPrice']
-            # ------------------------------
 
             df_master.dropna(thresh=2, inplace=True)
-            
+
             # Z-Score e Pesos
             weights_map = {'Res_Mom': w_rm, 'Value': w_val, 'Quality': w_qual}
             norm_cols = ['Res_Mom', 'Value', 'Quality']
@@ -628,21 +625,30 @@ def main():
                     new_col = f"{c}_Z"
                     df_master[new_col] = robust_zscore(df_master[c])
                     weights_keys[new_col] = weights_map.get(c, 0.0)
-
             final_df = build_composite_score(df_master, weights_keys)
-            
-            # 3. Backtests
+
+            # 3. Backtest dinâmico
             backtest_dynamic, factor_timing_df = run_dynamic_backtest(
                 prices, fundamentals, weights_map, top_n, use_vol_target, True, start_date_dca
             )
-            
+
+            # 4. Simulação DCA ← AQUI É ONDE AS VARIÁVEIS SÃO CRIADAS
+            dca_curve, dca_transactions, dca_holdings = run_dca_backtest(
+                prices, fundamentals, weights_map, top_n, dca_amount, use_vol_target, True, start_date_dca, end_date
+            )
+
             status.update(label="Concluído!", state="complete", expanded=False)
 
         # ==============================================================================
-        # TABS DE RESULTADOS
+        # AGORA SIM: TABS DE RESULTADOS (DENTRO DO IF run_btn)
         # ==============================================================================
         tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-            "🏆 Ranking & Regime", "📈 Performance & Risco", "💰 DCA & Histórico de Aportes", "🔮 Projeção Monte Carlo", "📊 Factor Timing", "🔍 Dados Brutos"
+            "🏆 Ranking & Regime",
+            "📈 Performance & Risco",
+            "💰 DCA & Histórico de Aportes",
+            "🔮 Projeção Monte Carlo",
+            "📊 Factor Timing",
+            "🔍 Dados Brutos"
         ])
 
         with tab1:
@@ -700,7 +706,7 @@ def main():
                                         color_discrete_map={'Strategy': '#00CC96', 'BOVA11': '#EF553B'}), 
                                 use_container_width=True)
 
-        with tab3:  # NOVA ABA DCA
+        with tab3:
             st.header("💰 Simulação de Aportes Mensais (DCA)")
             if not dca_curve.empty and not dca_transactions.empty:
                 total_invested = len(dca_transactions['Date'].unique()) * dca_amount
@@ -737,24 +743,24 @@ def main():
                                 'Quantidade': round(qty, 2),
                                 'Preço Atual': f"R$ {price:,.2f}",
                                 'Valor Atual': f"R$ {value:,.2f}",
-                                'Peso (%)': 0  # será calculado depois
                             })
                             total_current_value += value
                     if total_current_value > 0:
                         df_holdings = pd.DataFrame(holdings_data)
-                        df_holdings['Peso (%)'] = (df_holdings['Valor Atual'].str.replace(r'[R$\s,]', '', regex=True).astype(float) / total_current_value)
-                        df_holdings['Peso (%)'] = df_holdings['Peso (%)'].map("{:.1%}".format)
+                        values_numeric = df_holdings['Valor Atual'].str.replace(r'[R$\s,]', '', regex=True).astype(float)
+                        df_holdings['Peso (%)'] = (values_numeric / total_current_value).map("{:.1%}".format)
                         df_holdings = df_holdings.sort_values('Valor Atual', key=lambda x: x.str.replace(r'[R$\s,]', '', regex=True).astype(float), ascending=False)
+
                         col_pie, col_table = st.columns([1, 1])
                         with col_pie:
-                            pie_vals = [float(v.replace('R$', '').replace(',', '')) for v in df_holdings['Valor Atual']]
+                            pie_vals = values_numeric.tolist()
                             fig_pie = px.pie(values=pie_vals, names=df_holdings['Ticker'], title="Distribuição Atual", hole=0.4)
                             st.plotly_chart(fig_pie, use_container_width=True)
                         with col_table:
                             st.dataframe(df_holdings[['Ticker', 'Quantidade', 'Preço Atual', 'Valor Atual', 'Peso (%)']].set_index('Ticker'))
             else:
-                st.info("Não há dados suficientes para simular o DCA.")
-                
+                st.info("Não há dados suficientes para simular o DCA ou ainda não foram realizados aportes.")
+
         with tab4:
             st.subheader("Simulação Monte Carlo (Probabilística)")
             st.markdown(f"Projeção de **{mc_years} anos** com aporte mensal de **R$ {dca_amount:,.2f}**.")
