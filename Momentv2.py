@@ -813,11 +813,7 @@ def main():
                                         labels={'value': 'Patrimônio (R$)', 'index': 'Data'}),
                                 use_container_width=True)
 
-                st.subheader("📋 Histórico de Compras (Boletas Mensais)")
-                dca_transactions_display = dca_transactions.copy()
-                dca_transactions_display['Date'] = pd.to_datetime(dca_transactions_display['Date']).dt.strftime('%Y-%m')
-                dca_transactions_display = dca_transactions_display.sort_values('Date', ascending=False)
-                st.dataframe(dca_transactions_display.set_index('Date'), use_container_width=True)
+
 
                 st.subheader("💼 Carteira Acumulada (Posição Final)")
                 if dca_holdings:
@@ -848,6 +844,13 @@ def main():
                             st.plotly_chart(fig_pie, use_container_width=True)
                         with col_table:
                             st.dataframe(df_holdings[['Ticker', 'Quantidade', 'Preço Atual', 'Valor Atual', 'Peso (%)']].set_index('Ticker'))
+                            
+                st.subheader("📋 Histórico de Compras (Boletas Mensais)")
+                dca_transactions_display = dca_transactions.copy()
+                dca_transactions_display['Date'] = pd.to_datetime(dca_transactions_display['Date']).dt.strftime('%Y-%m')
+                dca_transactions_display = dca_transactions_display.sort_values('Date', ascending=False)
+                st.dataframe(dca_transactions_display.set_index('Date'), use_container_width=True)
+            
             else:
                 st.info("Não há dados suficientes para simular o DCA ou ainda não foram realizados aportes.")
 
