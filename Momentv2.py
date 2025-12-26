@@ -502,7 +502,14 @@ def main():
             df_master['Value'] = val_score
             df_master['Quality'] = qual_score
             
-            if 'sector' in fundamentals.columns: df_master['Sector'] = fundamentals['sector']
+            # --- CORREÇÃO APLICADA AQUI ---
+            if 'sector' in fundamentals.columns: 
+                df_master['Sector'] = fundamentals['sector']
+            
+            if 'currentPrice' in fundamentals.columns:
+                df_master['currentPrice'] = fundamentals['currentPrice']
+            # ------------------------------
+
             df_master.dropna(thresh=2, inplace=True)
             
             # Z-Score e Pesos
@@ -548,7 +555,14 @@ def main():
             current_top = final_df.head(top_n)
             st.markdown("---")
             st.subheader("Carteira Sugerida Hoje")
-            st.dataframe(current_top[['Composite_Score', 'Sector', 'currentPrice'] + list(weights_keys.keys())].style.background_gradient(cmap='RdYlGn', subset=['Composite_Score']))
+            
+            # Tratamento defensivo para exibição
+            cols_to_show = ['Composite_Score']
+            if 'Sector' in current_top.columns: cols_to_show.append('Sector')
+            if 'currentPrice' in current_top.columns: cols_to_show.append('currentPrice')
+            cols_to_show += list(weights_keys.keys())
+            
+            st.dataframe(current_top[cols_to_show].style.background_gradient(cmap='RdYlGn', subset=['Composite_Score']))
 
         with tab2:
             st.subheader(f"Análise de Risco ({dca_years} Anos)")
