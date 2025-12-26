@@ -641,7 +641,7 @@ def main():
         # ==============================================================================
         # TABS DE RESULTADOS
         # ==============================================================================
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
             "🏆 Ranking & Regime", "📈 Performance & Risco", "💰 DCA & Histórico de Aportes", "🔮 Projeção Monte Carlo", "📊 Factor Timing", "🔍 Dados Brutos"
         ])
 
