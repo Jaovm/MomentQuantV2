@@ -651,7 +651,7 @@ def main():
             "🔍 Dados Brutos"
         ])
 
-                with tab1:
+        with tab1:
             # Indicadores de Regime
             st.subheader("📊 Bússola de Mercado Atual")
             breadth, total_tickers = calculate_market_breadth(prices, 'BOVA11.SA')
