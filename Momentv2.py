@@ -157,14 +157,19 @@ def compute_composite_value_score(fund_df: pd.DataFrame) -> pd.Series:
     Inclui: E/P (Forward & Trailing), B/P, EBITDA/EV, CashFlow Yield.
     """
     df = fund_df.copy()
+    # Converter colunas para numérico para evitar TypeErrors
+    for col in df.columns:
+        if col != 'sector':
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
     val_metrics = pd.DataFrame(index=df.index)
     
     # Invertemos os múltiplos para que "maior é melhor" (Barato)
-    if 'forwardPE' in df: val_metrics['EP_Forward'] = np.where(df['forwardPE'] > 0, 1/df['forwardPE'], np.nan)
-    if 'trailingPE' in df: val_metrics['EP_Trailing'] = np.where(df['trailingPE'] > 0, 1/df['trailingPE'], np.nan)
-    if 'priceToBook' in df: val_metrics['BP'] = np.where(df['priceToBook'] > 0, 1/df['priceToBook'], np.nan)
-    if 'enterpriseToEbitda' in df: val_metrics['EBITDA_EV'] = np.where(df['enterpriseToEbitda'] > 0, 1/df['enterpriseToEbitda'], np.nan)
-    if 'cashFlowYield' in df: val_metrics['CF_Yield'] = df['cashFlowYield']
+    if 'forwardPE' in df.columns: val_metrics['EP_Forward'] = np.where(df['forwardPE'] > 0, 1/df['forwardPE'], np.nan)
+    if 'trailingPE' in df.columns: val_metrics['EP_Trailing'] = np.where(df['trailingPE'] > 0, 1/df['trailingPE'], np.nan)
+    if 'priceToBook' in df.columns: val_metrics['BP'] = np.where(df['priceToBook'] > 0, 1/df['priceToBook'], np.nan)
+    if 'enterpriseToEbitda' in df.columns: val_metrics['EBITDA_EV'] = np.where(df['enterpriseToEbitda'] > 0, 1/df['enterpriseToEbitda'], np.nan)
+    if 'cashFlowYield' in df.columns: val_metrics['CF_Yield'] = df['cashFlowYield']
     
     # Normalizar cada métrica antes de tirar a média
     for col in val_metrics.columns:
@@ -580,13 +585,13 @@ def main():
                 # Formatação amigável da tabela
                 display_ranked = ranked_df[['Composite_Score', 'Sector', 'Res_Mom', 'Value', 'Quality']].head(top_n).copy()
                 display_ranked.columns = ['Score Final', 'Setor', 'Momentum Residual', 'Valor Composto', 'Qualidade']
-                st.dataframe(display_ranked.style.background_gradient(cmap='RdYlGn', subset=['Score Final']), use_container_width=True, height=400)
+                st.dataframe(display_ranked.style.background_gradient(cmap='RdYlGn', subset=['Score Final']), width='stretch', height=400)
                 
                 if not backtest_1yr.empty:
                     st.subheader("📈 Curva de Equidade (Últimos 12 Meses)")
                     fig_perf = px.line(backtest_1yr, labels={'value': 'Retorno Acumulado', 'Date': 'Data'}, color_discrete_map={'Strategy': '#00CC96', 'BOVA11.SA': '#EF553B'})
                     fig_perf.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-                    st.plotly_chart(fig_perf, use_container_width=True)
+                    st.plotly_chart(fig_perf, width='stretch')
             
             with col2:
                 st.subheader("💼 Alocação da Carteira")
@@ -598,19 +603,22 @@ def main():
                 rebal_df['Peso'] = weights.values
                 rebal_df['Preço'] = latest_prices.reindex(weights.index).values
                 rebal_df['Alocação (R$)'] = rebal_df['Peso'] * dca_amount
-                rebal_df['Qtd. Sugerida'] = (rebal_df['Alocação (R$)'] / rebal_df['Preço']).round(0)
+                # Garantir que os preços sejam numéricos e tratar divisões por zero ou NaN
+                rebal_df['Preço'] = pd.to_numeric(rebal_df['Preço'], errors='coerce')
+                rebal_df['Qtd. Sugerida'] = (rebal_df['Alocação (R$)'] / rebal_df['Preço'].replace(0, np.nan))
+                rebal_df['Qtd. Sugerida'] = pd.to_numeric(rebal_df['Qtd. Sugerida'], errors='coerce').fillna(0).round(0)
                 
                 st.table(rebal_df[['Peso', 'Preço', 'Qtd. Sugerida']].style.format({'Peso': '{:.1%}', 'Preço': 'R$ {:.2f}', 'Qtd. Sugerida': '{:.0f}'}))
                 
                 fig_pie = px.pie(values=weights.values, names=weights.index, hole=0.5, color_discrete_sequence=px.colors.qualitative.Pastel)
                 fig_pie.update_layout(showlegend=True, legend=dict(orientation="h"))
-                st.plotly_chart(fig_pie, use_container_width=True)
+                st.plotly_chart(fig_pie, width='stretch')
 
         with tab2:
             st.subheader("Factor Timing: Performance Histórica por Fator")
             st.markdown("Este gráfico mostra como os ativos que hoje são 'Top Picks' de cada fator performaram nos últimos 3 anos.")
             if not timing_df.empty:
-                st.plotly_chart(px.line(timing_df, title="Evolução dos Fatores (Base 1.0)"), use_container_width=True)
+                st.plotly_chart(px.line(timing_df, title="Evolução dos Fatores (Base 1.0)"), width='stretch')
             else:
                 st.warning("Dados insuficientes para análise de timing.")
 
@@ -627,14 +635,14 @@ def main():
             
             fig_proj = px.area(projection, title=f"Projeção em {proj_years} anos (R$ {projection.iloc[-1]:,.2f})")
             fig_proj.update_layout(showlegend=False, yaxis_title="Patrimônio (R$)", xaxis_title="Meses")
-            st.plotly_chart(fig_proj, use_container_width=True)
+            st.plotly_chart(fig_proj, width='stretch')
             
             st.info(f"Com um aporte de R$ {dca_amount:,.2f} e retorno de {exp_ret:.2%}, seu patrimônio estimado será de R$ {projection.iloc[-1]:,.2f}")
 
         with tab4:
             st.subheader("Dados Brutos e Correlação")
             corr = final_df[['Res_Mom', 'Value', 'Quality', 'Fund_Mom']].corr()
-            st.plotly_chart(px.imshow(corr, text_auto=True, color_continuous_scale='RdBu_r'), use_container_width=True)
+            st.plotly_chart(px.imshow(corr, text_auto=True, color_continuous_scale='RdBu_r'), width='stretch')
             st.dataframe(fundamentals)
 
 if __name__ == "__main__":
