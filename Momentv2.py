@@ -442,7 +442,114 @@ def run_dynamic_backtest(all_prices, all_fundamentals, weights_config, top_n, us
         
         return cumulative.dropna(), factor_cum.dropna()
     return pd.DataFrame(), pd.DataFrame()
+# ==============================================================================
+# MÓDULO 5: DCA BACKTEST (NOVO - INTEGRADO DO MOMENT.PY)
+# ==============================================================================
+def run_dca_backtest(
+    all_prices: pd.DataFrame,
+    all_fundamentals: pd.DataFrame,
+    factor_weights: dict,
+    top_n: int,
+    dca_amount: float,
+    use_vol_target: bool,
+    use_sector_neutrality: bool,
+    start_date: datetime,
+    end_date: datetime
+):
+    """Simula aportes mensais constantes com rebalanceamento mensal."""
+    all_prices = all_prices.ffill()
+    dca_start = start_date + timedelta(days=30)
+    dates = all_prices.loc[dca_start:end_date].resample('MS').first().index.tolist()
 
+    if not dates or len(dates) < 2:
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+    portfolio_value = pd.Series(0.0, index=all_prices.index)
+    portfolio_holdings = {}
+    monthly_transactions = []
+
+    for i, month_start in enumerate(dates):
+        eval_date = month_start - timedelta(days=1)
+        mom_start = month_start - timedelta(days=500)
+        prices_for_mom = all_prices.loc[mom_start:eval_date]
+        risk_start = month_start - timedelta(days=90)
+        prices_for_risk = all_prices.loc[risk_start:eval_date]
+
+        # Cálculo dos fatores
+        res_mom = compute_residual_momentum_enhanced(prices_for_mom) if not prices_for_mom.empty else pd.Series(dtype=float)
+        val_score = compute_value_robust(all_fundamentals)
+        qual_score = compute_quality_score(all_fundamentals)
+
+        df_master = pd.DataFrame(index=all_prices.columns.drop(['BOVA11.SA', 'DIVO11.SA'], errors='ignore'))
+        df_master['Res_Mom'] = res_mom
+        df_master['Value'] = val_score
+        df_master['Quality'] = qual_score
+        if 'sector' in all_fundamentals.columns:
+            df_master['Sector'] = all_fundamentals['sector']
+        df_master.dropna(thresh=2, inplace=True)
+
+        norm_cols = ['Res_Mom', 'Value', 'Quality']
+        weights_keys = {}
+        if use_sector_neutrality and 'Sector' in df_master.columns and df_master['Sector'].nunique() > 1:
+            for c in norm_cols:
+                if c in df_master.columns:
+                    new_col = f"{c}_Z_Sector"
+                    df_master[new_col] = df_master.groupby('Sector')[c].transform(
+                        lambda x: robust_zscore(x) if len(x) > 1 else x - x.median()
+                    )
+                    weights_keys[new_col] = factor_weights.get(c, 0.0)
+        else:
+            for c in norm_cols:
+                if c in df_master.columns:
+                    new_col = f"{c}_Z"
+                    df_master[new_col] = robust_zscore(df_master[c])
+                    weights_keys[new_col] = factor_weights.get(c, 0.0)
+
+        final_df = build_composite_score(df_master, weights_keys)
+        current_weights = construct_portfolio(final_df, prices_for_risk, top_n, 0.15 if use_vol_target else None)
+
+        try:
+            rebal_price = all_prices.loc[all_prices.index >= month_start].iloc[0].to_frame().T
+        except IndexError:
+            break
+
+        # Aporte mensal
+        for ticker, weight in current_weights.items():
+            if ticker in rebal_price.columns and not rebal_price[ticker].isna().iloc[0]:
+                price = rebal_price[ticker].iloc[0]
+                if price > 0 and weight > 0:
+                    amount = dca_amount * weight
+                    quantity = amount / price
+                    portfolio_holdings[ticker] = portfolio_holdings.get(ticker, 0.0) + quantity
+                    monthly_transactions.append({
+                        'Date': rebal_price.index[0],
+                        'Ticker': ticker,
+                        'Action': 'Buy (DCA)',
+                        'Quantity': round(quantity, 4),
+                        'Price': round(price, 2),
+                        'Value_R$': round(amount, 2)
+                    })
+
+        # Atualiza valor diário do portfólio até o próximo aporte
+        next_month = dates[i+1] if i < len(dates)-1 else end_date
+        valuation_dates = all_prices.loc[rebal_price.index[0]:next_month].index
+
+        for current_date in valuation_dates:
+            current_port_value = sum(
+                portfolio_holdings.get(t, 0) * all_prices.loc[current_date, t]
+                for t in portfolio_holdings
+                if t in all_prices.columns and current_date in all_prices.index
+            )
+            portfolio_value[current_date] = current_port_value
+
+    portfolio_value = portfolio_value[portfolio_value > 0].ffill().dropna()
+    equity_curve = pd.DataFrame({'Strategy_DCA': portfolio_value})
+
+    transactions_df = pd.DataFrame(monthly_transactions)
+    final_holdings = {k: v for k, v in portfolio_holdings.items() if v > 0}
+
+    return equity_curve, transactions_df, final_holdings
+    
 # ==============================================================================
 # APP PRINCIPAL
 # ==============================================================================
@@ -535,7 +642,7 @@ def main():
         # TABS DE RESULTADOS
         # ==============================================================================
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "🏆 Ranking & Regime", "📈 Performance & Risco", "🔮 Projeção Monte Carlo", "📊 Factor Timing", "🔍 Dados Brutos"
+            "🏆 Ranking & Regime", "📈 Performance & Risco", "💰 DCA & Histórico de Aportes", "🔮 Projeção Monte Carlo", "📊 Factor Timing", "🔍 Dados Brutos"
         ])
 
         with tab1:
@@ -593,7 +700,62 @@ def main():
                                         color_discrete_map={'Strategy': '#00CC96', 'BOVA11': '#EF553B'}), 
                                 use_container_width=True)
 
-        with tab3:
+        with tab3:  # NOVA ABA DCA
+            st.header("💰 Simulação de Aportes Mensais (DCA)")
+            if not dca_curve.empty and not dca_transactions.empty:
+                total_invested = len(dca_transactions['Date'].unique()) * dca_amount
+                final_value = dca_curve['Strategy_DCA'].iloc[-1]
+                total_return = (final_value / total_invested) - 1 if total_invested > 0 else 0
+
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Total Aportado", f"R$ {total_invested:,.2f}")
+                col2.metric("Patrimônio Final", f"R$ {final_value:,.2f}")
+                col3.metric("Retorno Total", f"{total_return:.2%}")
+                col4.metric("Aportes Realizados", len(dca_transactions['Date'].unique()))
+
+                st.plotly_chart(px.line(dca_curve, title="Evolução do Patrimônio com Aportes Mensais",
+                                        labels={'value': 'Patrimônio (R$)', 'index': 'Data'}),
+                                use_container_width=True)
+
+                st.subheader("📋 Histórico de Compras (Boletas Mensais)")
+                dca_transactions_display = dca_transactions.copy()
+                dca_transactions_display['Date'] = pd.to_datetime(dca_transactions_display['Date']).dt.strftime('%Y-%m')
+                dca_transactions_display = dca_transactions_display.sort_values('Date', ascending=False)
+                st.dataframe(dca_transactions_display.set_index('Date'), use_container_width=True)
+
+                st.subheader("💼 Carteira Acumulada (Posição Final)")
+                if dca_holdings:
+                    last_prices = prices.iloc[-1]
+                    holdings_data = []
+                    total_current_value = 0
+                    for ticker, qty in dca_holdings.items():
+                        price = last_prices.get(ticker, np.nan)
+                        if not np.isnan(price):
+                            value = qty * price
+                            holdings_data.append({
+                                'Ticker': ticker,
+                                'Quantidade': round(qty, 2),
+                                'Preço Atual': f"R$ {price:,.2f}",
+                                'Valor Atual': f"R$ {value:,.2f}",
+                                'Peso (%)': 0  # será calculado depois
+                            })
+                            total_current_value += value
+                    if total_current_value > 0:
+                        df_holdings = pd.DataFrame(holdings_data)
+                        df_holdings['Peso (%)'] = (df_holdings['Valor Atual'].str.replace(r'[R$\s,]', '', regex=True).astype(float) / total_current_value)
+                        df_holdings['Peso (%)'] = df_holdings['Peso (%)'].map("{:.1%}".format)
+                        df_holdings = df_holdings.sort_values('Valor Atual', key=lambda x: x.str.replace(r'[R$\s,]', '', regex=True).astype(float), ascending=False)
+                        col_pie, col_table = st.columns([1, 1])
+                        with col_pie:
+                            pie_vals = [float(v.replace('R$', '').replace(',', '')) for v in df_holdings['Valor Atual']]
+                            fig_pie = px.pie(values=pie_vals, names=df_holdings['Ticker'], title="Distribuição Atual", hole=0.4)
+                            st.plotly_chart(fig_pie, use_container_width=True)
+                        with col_table:
+                            st.dataframe(df_holdings[['Ticker', 'Quantidade', 'Preço Atual', 'Valor Atual', 'Peso (%)']].set_index('Ticker'))
+            else:
+                st.info("Não há dados suficientes para simular o DCA.")
+                
+        with tab4:
             st.subheader("Simulação Monte Carlo (Probabilística)")
             st.markdown(f"Projeção de **{mc_years} anos** com aporte mensal de **R$ {dca_amount:,.2f}**.")
             st.info("Baseado na média (mu) e volatilidade (sigma) históricas da Estratégia.")
@@ -630,7 +792,7 @@ def main():
                 fig_mc.update_layout(title="Cone de Probabilidade Patrimonial", yaxis_title="Patrimônio (R$)", hovermode="x unified")
                 st.plotly_chart(fig_mc, use_container_width=True)
 
-        with tab4:
+        with tab5:
             st.subheader("Factor Timing & Correlações")
             if not factor_timing_df.empty:
                 norm_factors = factor_timing_df / factor_timing_df.iloc[0]
@@ -639,7 +801,7 @@ def main():
                 corr = factor_timing_df.pct_change().corr()
                 st.plotly_chart(px.imshow(corr, text_auto=True, title="Correlação Histórica"), use_container_width=True)
 
-        with tab5:
+        with tab6:
             st.dataframe(fundamentals)
 
 if __name__ == "__main__":
