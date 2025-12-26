@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 # CONFIGURAÇÃO DA PÁGINA
 # ==============================================================================
 st.set_page_config(
-    page_title="Quant Factor Lab Pro v3 (Monte Carlo & Risk)",
+    page_title="Quant Factor Lab Pro v2 (Monte Carlo & Risk)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -555,11 +555,11 @@ def run_dca_backtest(
 # ==============================================================================
 
 def main():
-    st.title("🧪 Quant Factor Lab: Pro v3 (Monte Carlo & Risk)")
+    st.title("🧪 Quant Factor Lab: Pro v2 (Monte Carlo & Risk)")
     st.markdown("Otimização Multifator com **Value Robusto**, **Momentum Residual** e **Análise de Risco Avançada**.")
 
     st.sidebar.header("1. Universo e Dados")
-    default_univ = "ITUB3.SA, TOTS3.SA, MDIA3.SA, TAEE3.SA, BBSE3.SA, WEGE3.SA, PSSA3.SA, EGIE3.SA, B3SA3.SA, VIVT3.SA, AGRO3.SA, PRIO3.SA, BBAS3.SA, BPAC11.SA, SBSP3.SA, SAPR4.SA, CMIG3.SA, UNIP6.SA, FRAS3.SA, VALE3.SA, PETR4.SA, RENT3.SA, LREN3.SA"
+    default_univ = "ITUB3.SA, TOTS3.SA, MDIA3.SA, TAEE3.SA, BBSE3.SA, WEGE3.SA, PSSA3.SA, EGIE3.SA, B3SA3.SA, VIVT3.SA, AGRO3.SA, PRIO3.SA, BBAS3.SA, BPAC11.SA, SBSP3.SA, SAPR4.SA, CMIG3.SA, UNIP6.SA, FRAS3.SA, CPFE3.SA"
     ticker_input = st.sidebar.text_area("Tickers (Separados por vírgula)", default_univ, height=100)
     tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
 
@@ -574,9 +574,9 @@ def main():
     
     st.sidebar.markdown("---")
     st.sidebar.header("4. Simulação & Monte Carlo")
-    dca_amount = st.sidebar.number_input("Aporte Mensal (R$)", 100, 50000, 2000)
-    dca_years = st.sidebar.slider("Anos de Backtest Histórico", 1, 5, 3)
-    mc_years = st.sidebar.slider("Anos de Projeção (MC)", 5, 30, 10)
+    dca_amount = st.sidebar.number_input("Aporte Mensal (R$)", 100, 50000, 1000)
+    dca_years = st.sidebar.slider("Anos de Backtest Histórico", 1, 5, 5)
+    mc_years = st.sidebar.slider("Anos de Projeção (MC)", 1, 30, 1)
     
     run_btn = st.sidebar.button("🚀 Rodar Análise Completa", type="primary")
 
