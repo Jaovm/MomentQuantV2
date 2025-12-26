@@ -667,15 +667,11 @@ def main():
                 except:
                     col_b2.metric("Fator Dominante (6 meses)", "N/A", "")
             
-            # Última atualização
             last_update = prices.index[-1].strftime("%d/%m/%Y")
             col_b3.metric("Última Atualização", last_update)
 
             st.markdown("---")
             
-            # ============================================================
-            # CARTEIRA SUGERIDA HOJE - APRESENTAÇÃO PROFISSIONAL
-            # ============================================================
             st.subheader("💼 Carteira Sugerida Hoje (Baseado no Score Composto)")
             
             current_top = final_df.head(top_n).copy()
@@ -683,61 +679,58 @@ def main():
             if current_top.empty:
                 st.warning("Nenhum ativo qualificado com os filtros atuais.")
             else:
-                # Pega preços atuais
+                # Preços atuais
                 latest_prices = prices.iloc[-1]
                 current_top['Preço Atual'] = latest_prices.reindex(current_top.index)
                 
-                # Calcula pesos sugeridos (com ou sem risk parity)
+                # Pesos sugeridos
                 suggested_weights = construct_portfolio(final_df, prices, top_n, 0.15 if use_vol_target else None)
-                current_top['Peso Sugerido (%)'] = suggested_weights.reindex(current_top.index) * 100
+                current_top['Peso Sugerido (%)'] = (suggested_weights.reindex(current_top.index) * 100).round(1)
                 
-                # Arredonda e formata
-                current_top['Peso Sugerido (%)'] = current_top['Peso Sugerido (%)'].round(1)
-                current_top['Preço Atual'] = current_top['Preço Atual'].round(2)
+                # Alocação e quantidade
+                current_top['Alocação R$'] = (current_top['Peso Sugerido (%)'] / 100 * dca_amount).round(0)
+                current_top['Qtd. Aprox'] = (current_top['Alocação R$'] / current_top['Preço Atual']).round(0)
                 
-                # Calcula alocação em R$ com base no aporte mensal (exemplo prático)
-                current_top['Alocação R$ (ex: R$ 2.000)'] = (current_top['Peso Sugerido (%)'] / 100 * dca_amount).round(0)
-                current_top['Qtd. Aprox'] = (current_top['Alocação R$ (ex: R$ 2.000)'] / current_top['Preço Atual']).round(0)
+                # Prepara dataframe para exibição
+                display_df = current_top.copy()
                 
-                # Colunas para exibição bonita
-                display_cols = ['Peso Sugerido (%)', 'Preço Atual', 'Alocação R$ (ex: R$ 2.000)', 'Qtd. Aprox']
-                if 'Sector' in current_top.columns:
-                    display_cols = ['Sector'] + display_cols
-                if 'currentPrice' in current_top.columns:
-                    current_top['Preço Atual'] = current_top['Preço Atual'].fillna(current_top['currentPrice'])
+                # Colunas a mostrar
+                base_cols = ['Peso Sugerido (%)', 'Preço Atual', 'Alocação R$', 'Qtd. Aprox', 'Composite_Score']
+                if 'Sector' in display_df.columns:
+                    base_cols = ['Sector'] + base_cols
                 
-                # Tabela principal estilizada
-                styled_df = current_top[display_cols + ['Composite_Score']].copy()
+                display_df = display_df[base_cols]
                 
-                # Formatação
-                styled_df['Peso Sugerido (%)'] = styled_df['Peso Sugerido (%)'].map("{:.1f}%".format)
-                styled_df['Preço Atual'] = styled_df['Preço Atual'].map("R$ {:,.2f}".format)
-                styled_df['Alocação R$ (ex: R$ 2.000)'] = styled_df['Alocação R$ (ex: R$ 2.000)'].map("R$ {:,.0f}".format)
-                styled_df['Qtd. Aprox'] = styled_df['Qtd. Aprox'].astype(int)
-                styled_df['Composite_Score'] = styled_df['Composite_Score'].round(3)
+                # === ESTILOS APLICADOS ANTES DA FORMATAÇÃO DE STRING ===
+                styler = display_df.style \
+                    .background_gradient(subset=['Composite_Score'], cmap='RdYlGn') \
+                    .bar(subset=['Peso Sugerido (%)'], color='#00CC96', vmin=0, vmax=100) \
+                    .format({
+                        'Peso Sugerido (%)': '{:.1f}%',
+                        'Preço Atual': 'R$ {:,.2f}',
+                        'Alocação R$': 'R$ {:,.0f}',
+                        'Qtd. Aprox': '{:.0f}',
+                        'Composite_Score': '{:.3f}'
+                    })
                 
-                # Renomeia para exibição
-                rename_map = {
+                # Renomeia colunas para exibição mais amigável
+                styler = styler.set_properties(**{'text-align': 'center'})
+                styler = styler.set_table_styles([{
+                    'selector': 'th',
+                    'props': [('text-align', 'center')]
+                }])
+                
+                rename_dict = {
+                    'Sector': 'Setor',
                     'Peso Sugerido (%)': 'Peso Sugerido',
                     'Preço Atual': 'Preço Atual',
-                    'Alocação R$ (ex: R$ 2.000)': f'Alocação (R$ {dca_amount:,.0f})',
+                    'Alocação R$': f'Alocação (R$ {dca_amount:,.0f})',
                     'Qtd. Aprox': 'Qtd. Aprox',
-                    'Composite_Score': 'Score Composto',
-                    'Sector': 'Setor'
+                    'Composite_Score': 'Score Composto'
                 }
-                styled_df = styled_df.rename(columns=rename_map)
+                styler = styler.relabel_index([rename_dict.get(c, c) for c in base_cols], axis=1)
                 
-                # Ordem final
-                final_display_cols = [rename_map.get(c, c) for c in display_cols] + ['Score Composto']
-                
-                st.dataframe(
-                    styled_df[final_display_cols]
-                        .sort_values('Peso Sugerido', ascending=False)
-                        .style.background_gradient(subset=['Score Composto'], cmap='RdYlGn')
-                        .bar(subset=['Peso Sugerido'], color='#00CC96'),
-                    use_container_width=True,
-                    height=400
-                )
+                st.dataframe(styler, use_container_width=True, height=400)
                 
                 # Gráficos visuais
                 col_pie, col_bar = st.columns([1, 2])
@@ -746,7 +739,7 @@ def main():
                     fig_pie = px.pie(
                         values=suggested_weights.values,
                         names=suggested_weights.index,
-                        title="Distribuição Teórica da Carteira",
+                        title="Distribuição Teórica",
                         hole=0.4,
                         color_discrete_sequence=px.colors.sequential.Greens_r
                     )
@@ -754,8 +747,8 @@ def main():
                     st.plotly_chart(fig_pie, use_container_width=True)
                 
                 with col_bar:
-                    weight_df = suggested_weights.to_frame('Peso (%)').sort_values('Peso (%)', ascending=True)
-                    weight_df['Peso (%)'] = weight_df['Peso (%)'] * 100
+                    weight_df = suggested_weights.to_frame('Peso').sort_values('Peso', ascending=True)
+                    weight_df['Peso (%)'] = (weight_df['Peso'] * 100).round(1)
                     fig_bar = px.bar(
                         weight_df,
                         x='Peso (%)',
@@ -770,11 +763,9 @@ def main():
                     fig_bar.update_layout(showlegend=False, height=400)
                     st.plotly_chart(fig_bar, use_container_width=True)
                 
-                # Dica prática
                 st.caption(
-                    f"💡 Sugestão prática: A cada aporte mensal de R$ {dca_amount:,.0f}, "
-                    f"compre aproximadamente as quantidades indicadas acima. "
-                    f"Rebalanceie trimestralmente ou quando algum ativo desviar >5% do peso alvo."
+                    f"💡 Sugestão: Com aporte de R$ {dca_amount:,.0f}, compre aproximadamente as quantidades indicadas. "
+                    "Rebalanceie quando algum ativo desviar mais de 5% do peso alvo."
                 )
         with tab2:
             st.subheader(f"Análise de Risco ({dca_years} Anos)")
