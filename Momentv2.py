@@ -25,7 +25,7 @@ def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFr
     """Busca histórico de preços ajustados, garantindo benchmarks."""
     t_list = list(tickers)
     # Garante benchmarks
-    for bench in ['BOVA11.SA', 'SMAL11.SA']:
+    for bench in ['BOVA11.SA', 'DIVO11.SA']:
         if bench not in t_list:
             t_list.append(bench)
     
@@ -66,7 +66,7 @@ def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFr
 def fetch_fundamentals(tickers: list) -> pd.DataFrame:
     """Busca snapshots fundamentais com tratamento de erro granular."""
     data = []
-    clean_tickers = [t for t in tickers if t not in ['BOVA11.SA', 'SMAL11.SA']]
+    clean_tickers = [t for t in tickers if t not in ['BOVA11.SA', 'DIVO11.SA']]
     failed_tickers = []
     
     progress_bar = st.progress(0)
@@ -145,7 +145,7 @@ def compute_residual_momentum_enhanced(price_df: pd.DataFrame, lookback=36, skip
     formation_window = 12 
     
     for ticker in rets.columns:
-        if ticker in ['BOVA11.SA', 'SMAL11.SA']: continue
+        if ticker in ['BOVA11.SA', 'DIVO11.SA']: continue
         
         y_full = rets[ticker].tail(lookback + skip)
         x_full = market.tail(lookback + skip)
@@ -369,7 +369,7 @@ def run_dynamic_backtest(all_prices, all_fundamentals, weights_config, top_n, us
         val_score = compute_value_robust(all_fundamentals)
         qual_score = compute_quality_score(all_fundamentals)
         
-        df_period = pd.DataFrame(index=all_prices.columns.drop(['BOVA11.SA', 'SMAL11.SA'], errors='ignore'))
+        df_period = pd.DataFrame(index=all_prices.columns.drop(['BOVA11.SA', 'DIVO11.SA'], errors='ignore'))
         df_period['Res_Mom'] = res_mom
         df_period['Value'] = val_score
         df_period['Quality'] = qual_score
@@ -407,7 +407,7 @@ def run_dynamic_backtest(all_prices, all_fundamentals, weights_config, top_n, us
         
         strategy_rets.append(strat_ret)
         bench_rets.append(period_pct['BOVA11.SA'] if 'BOVA11.SA' in period_pct.columns else pd.Series(0.0, index=period_pct.index))
-        smal_rets.append(period_pct['SMAL11.SA'] if 'SMAL11.SA' in period_pct.columns else pd.Series(0.0, index=period_pct.index))
+        smal_rets.append(period_pct['DIVO11.SA'] if 'DIVO11.SA' in period_pct.columns else pd.Series(0.0, index=period_pct.index))
 
         # Factor Tracking (Puro)
         for factor in ['Res_Mom', 'Value', 'Quality']:
@@ -430,7 +430,7 @@ def run_dynamic_backtest(all_prices, all_fundamentals, weights_config, top_n, us
         cumulative = pd.DataFrame({
             'Strategy': (1 + full_strategy.loc[common_idx]).cumprod(),
             'BOVA11': (1 + full_benchmark.loc[common_idx]).cumprod(),
-            'SMAL11': (1 + full_smal.loc[common_idx]).cumprod()
+            'DIVO11': (1 + full_smal.loc[common_idx]).cumprod()
         })
         
         factor_cum = pd.DataFrame(index=cumulative.index)
@@ -570,10 +570,10 @@ def main():
                 # Calcula métricas para Estratégia e Benchmarks
                 m_strat = calculate_advanced_metrics(backtest_dynamic['Strategy'])
                 m_bova = calculate_advanced_metrics(backtest_dynamic['BOVA11'])
-                m_smal = calculate_advanced_metrics(backtest_dynamic['SMAL11'])
+                m_smal = calculate_advanced_metrics(backtest_dynamic['DIVO11'])
                 
                 # Tabela Comparativa
-                metrics_df = pd.DataFrame([m_strat, m_bova, m_smal], index=['Estratégia', 'BOVA11', 'SMAL11'])
+                metrics_df = pd.DataFrame([m_strat, m_bova, m_smal], index=['Estratégia', 'BOVA11', 'DIVO11'])
                 
                 # Formatação
                 fmt_dict = {
@@ -584,7 +584,7 @@ def main():
                 st.dataframe(metrics_df.style.format(fmt_dict).background_gradient(cmap='RdYlGn', axis=0))
                 
                 st.plotly_chart(px.line(backtest_dynamic, title="Curva de Retorno Acumulado", 
-                                        color_discrete_map={'Strategy': '#00CC96', 'BOVA11': '#EF553B', 'SMAL11': '#636EFA'}), 
+                                        color_discrete_map={'Strategy': '#00CC96', 'BOVA11': '#EF553B', 'DIVO11': '#636EFA'}), 
                                 use_container_width=True)
                 
                 # Drawdown Chart
