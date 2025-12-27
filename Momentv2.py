@@ -13,12 +13,13 @@ import time
 # CONFIGURAÇÃO DA PÁGINA
 # ==============================================================================
 st.set_page_config(
-    page_title="Quant Factor Lab Pro v3.1 (Benchmark Ed.)",
+    page_title="Quant Factor Lab Pro v3.2 (Fix Brapi)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # Constantes
+# DICA: Se este token falhar, cadastre-se na brapi.dev (grátis) e coloque seu próprio token aqui.
 BRAPI_TOKEN = "5gVedSQ928pxhFuTvBFPfr"
 
 # ==============================================================================
@@ -27,7 +28,7 @@ BRAPI_TOKEN = "5gVedSQ928pxhFuTvBFPfr"
 
 @st.cache_data(ttl=3600*12)
 def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFrame:
-    """Busca histórico de preços ajustados via YFinance (melhor para OHLCV histórico)."""
+    """Busca histórico de preços ajustados via YFinance."""
     t_list = list(tickers)
     # Garante benchmarks
     for bench in ['BOVA11.SA', 'DIVO11.SA']:
@@ -40,7 +41,7 @@ def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFr
             start=start_date, 
             end=end_date, 
             progress=False,
-            auto_adjust=False, # Ajustaremos manualmente se necessário, mas 'Adj Close' costuma ser melhor
+            auto_adjust=False,
             threads=True
         )['Adj Close']
         
@@ -53,57 +54,86 @@ def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFr
         data = data.dropna(axis=1, how='all')
         return data
     except Exception as e:
-        st.error(f"Erro crítico ao baixar preços: {e}")
+        st.error(f"Erro crítico ao baixar preços YF: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600*6)
 def fetch_fundamentals_brapi(tickers: list, token: str) -> pd.DataFrame:
     """
-    Busca fundamentos ATUAIS via Brapi.dev para o Ranking de Seleção.
-    Agrupa requisições para economizar chamadas.
+    Busca fundamentos ATUAIS via Brapi.dev com tratamento de erro robusto.
     """
     clean_tickers = [t for t in tickers if t not in ['BOVA11.SA', 'DIVO11.SA']]
     if not clean_tickers:
         return pd.DataFrame()
 
-    # Brapi suporta virgula: PETR4,VALE3 (limite de url, vamos fazer chunks de 15)
-    chunk_size = 15
+    # Chunk size menor para evitar timeouts em conexões lentas ou limites da API
+    chunk_size = 10 
     chunks = [clean_tickers[i:i + chunk_size] for i in range(0, len(clean_tickers), chunk_size)]
     
     fundamental_data = []
+    failed_tickers = []
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
+    # Função auxiliar para garantir conversão segura de números
+    def safe_float(val):
+        if val is None: return np.nan
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return np.nan
+
     for i, chunk in enumerate(chunks):
         status_text.text(f"Consultando Brapi API: Lote {i+1}/{len(chunks)}")
         ticker_str = ','.join(chunk)
         url = f"https://brapi.dev/api/quote/{ticker_str}"
+        
+        # Adicionamos modules para tentar garantir que dados financeiros venham
         params = {
             'token': token,
-            'fundamental': 'true', 
+            'fundamental': 'true',
+            'modules': 'summaryProfile,defaultKeyStatistics' 
         }
         
         try:
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, params=params, timeout=15)
+            
             if response.status_code == 200:
-                results = response.json().get('results', [])
+                data_json = response.json()
+                results = data_json.get('results', [])
+                
+                if not results:
+                    st.warning(f"Aviso: A Brapi retornou lista vazia para o lote: {chunk}")
+
                 for item in results:
                     try:
                         symbol = item.get('symbol')
-                        price = item.get('regularMarketPrice', np.nan)
                         
-                        sector = item.get('sector', 'Unknown')
-                        if sector == 'Unknown' or not sector:
+                        # Extração Segura
+                        price = safe_float(item.get('regularMarketPrice'))
+                        market_cap = safe_float(item.get('marketCap'))
+                        
+                        # Setor (Tenta raiz, senão tenta inferir)
+                        sector = item.get('sector')
+                        if not sector or sector == 'Unknown':
+                            # Fallback simples
                             sector = 'General'
 
-                        market_cap = item.get('marketCap', np.nan)
-                        pe_ratio = item.get('priceEarnings', np.nan) 
-                        p_vp = item.get('priceToBook', np.nan) 
-                        ev_ebitda = item.get('enterpriseValueToEBITDA', np.nan)
-                        roe = item.get('returnOnEquity', np.nan)
-                        net_margin = item.get('profitMargin', np.nan)
+                        # Value Metrics
+                        pe_ratio = safe_float(item.get('priceEarnings'))
+                        if np.isnan(pe_ratio):
+                            # Tenta buscar em chaves alternativas caso a estrutura mude
+                            pe_ratio = safe_float(item.get('trailingPE'))
+
+                        p_vp = safe_float(item.get('priceToBook'))
+                        ev_ebitda = safe_float(item.get('enterpriseValueToEBITDA'))
                         
+                        # Quality Metrics
+                        roe = safe_float(item.get('returnOnEquity'))
+                        net_margin = safe_float(item.get('profitMargin'))
+                        
+                        # Monta o objeto
                         fundamental_data.append({
                             'ticker': symbol,
                             'sector': sector,
@@ -115,25 +145,35 @@ def fetch_fundamentals_brapi(tickers: list, token: str) -> pd.DataFrame:
                             'ROE': roe,
                             'Net_Margin': net_margin,
                         })
-                    except Exception as e_inner:
-                        print(f"Erro ao parsear {item.get('symbol')}: {e_inner}")
+                    except Exception as e_parse:
+                        # Log discreto para não poluir a UI, mas útil se tudo falhar
+                        print(f"Erro parse {item.get('symbol', 'Unknown')}: {e_parse}")
+                        failed_tickers.append(item.get('symbol', 'Unknown'))
             else:
-                print(f"Erro na requisição Brapi: {response.status_code}")
+                st.error(f"Erro Brapi API (Lote {i+1}): Status {response.status_code}. Verifique o Token.")
+                if response.status_code == 401 or response.status_code == 403:
+                    st.warning("⚠️ Seu Token da Brapi parece inválido ou expirado. Atualize no código.")
                 
-        except Exception as e:
-            st.warning(f"Erro de conexão com Brapi: {e}")
+        except Exception as e_req:
+            st.warning(f"Erro de conexão com Brapi no lote {i+1}: {e_req}")
         
         progress_bar.progress((i + 1) / len(chunks))
-        time.sleep(0.5) 
+        time.sleep(0.2) # Rate limit handling
 
     progress_bar.empty()
     status_text.empty()
     
     if not fundamental_data:
+        st.warning("⚠️ Nenhum dado fundamentalista foi recuperado. Verifique os Tickers e o Token.")
         return pd.DataFrame()
         
-    df = pd.DataFrame(fundamental_data).set_index('ticker')
+    df = pd.DataFrame(fundamental_data)
     
+    # Remove duplicatas se houver
+    df = df.drop_duplicates(subset=['ticker'])
+    df = df.set_index('ticker')
+    
+    # Limpeza de zeros irreais
     cols_to_clean = ['PE', 'P_VP', 'EV_EBITDA', 'ROE', 'Net_Margin']
     for col in cols_to_clean:
         if col in df.columns:
@@ -204,6 +244,10 @@ def compute_value_robust(fund_df: pd.DataFrame) -> pd.Series:
     if 'P_VP' in fund_df: scores['Book_Yield'] = invert_metric(fund_df['P_VP'])
     if 'EV_EBITDA' in fund_df: scores['EBITDA_Yield'] = invert_metric(fund_df['EV_EBITDA'])
 
+    # Se não houver métricas de valor, retorna 0
+    if scores.empty or scores.dropna(how='all').empty:
+        return pd.Series(0, index=fund_df.index, name="Value_Score")
+
     for col in scores.columns:
         filled = scores[col].fillna(scores[col].median())
         if filled.std() > 0:
@@ -219,6 +263,9 @@ def compute_quality_score(fund_df: pd.DataFrame) -> pd.Series:
     
     if 'ROE' in fund_df: scores['ROE'] = fund_df['ROE']
     if 'Net_Margin' in fund_df: scores['Margin'] = fund_df['Net_Margin']
+
+    if scores.empty or scores.dropna(how='all').empty:
+        return pd.Series(0, index=fund_df.index, name="Quality_Score")
     
     for col in scores.columns:
         filled = scores[col].fillna(scores[col].median())
@@ -304,11 +351,11 @@ def run_monte_carlo(initial_balance, monthly_contrib, mu_annual, sigma_annual, y
     }, index=dates)
 
 # ==============================================================================
-# MÓDULO 5: BACKTEST & ENGINE (COM CORREÇÃO DE VIÉS & BENCHMARK)
+# MÓDULO 5: BACKTEST & ENGINE
 # ==============================================================================
 
 def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame, top_n: int, vol_target: bool = False):
-    """Constrói pesos. Se vol_target=True, usa Inverse Volatility (Risk Parity)."""
+    """Constrói pesos."""
     selected = ranked_df.head(top_n).index.tolist()
     if not selected: return pd.Series()
 
@@ -323,10 +370,7 @@ def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame, top_n: in
     return weights.sort_values(ascending=False)
 
 def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: float, use_vol_target: bool, start_date: datetime, end_date: datetime):
-    """
-    Simula aportes mensais constantes.
-    **MODO ROBUSTO**: Utiliza apenas Price-Action (Momentum e Volatilidade) para decisão histórica.
-    """
+    """Backtest Robusto."""
     all_prices = all_prices.ffill()
     dca_start = start_date + timedelta(days=30)
     
@@ -343,12 +387,12 @@ def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: fl
     cash = 0.0 
 
     for i, month_start in enumerate(dates):
-        # 1. Definição das janelas de dados
+        # 1. Definição das janelas
         eval_date = month_start - timedelta(days=1)
         mom_start = month_start - timedelta(days=365*3) 
         prices_historical = all_prices.loc[mom_start:eval_date]
         
-        # 2. Screening (Apenas Momentum Residual)
+        # 2. Screening
         res_mom = compute_residual_momentum_enhanced(prices_historical, lookback=12, skip=1)
         
         if res_mom.empty:
@@ -358,11 +402,11 @@ def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: fl
         df_rank['Score'] = robust_zscore(res_mom)
         df_rank = df_rank.sort_values('Score', ascending=False)
         
-        # 3. Definição de Pesos
+        # 3. Pesos
         risk_window = prices_historical.tail(90)
         target_weights = construct_portfolio(df_rank, risk_window, top_n, use_vol_target)
         
-        # 4. Execução de Aportes
+        # 4. Execução
         try:
             current_date_prices = all_prices.loc[month_start]
         except KeyError:
@@ -374,14 +418,12 @@ def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: fl
 
         total_portfolio_val = cash + dca_amount
         
-        # Liquida posições antigas
         for t, qtd in portfolio_holdings.items():
             if t in current_date_prices:
                 price = current_date_prices[t]
                 if not np.isnan(price):
                     total_portfolio_val += qtd * price
         
-        # Nova distribuição
         new_holdings = {}
         
         for ticker, weight in target_weights.items():
@@ -402,7 +444,7 @@ def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: fl
         
         portfolio_holdings = new_holdings
         
-        # 5. Marcação a Mercado
+        # 5. MTM
         next_month = dates[i+1] if i < len(dates)-1 else end_date
         valuation_dates = all_prices.loc[month_start:next_month].index
         
@@ -422,49 +464,30 @@ def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: fl
     return equity_curve, transactions_df, final_holdings
 
 def run_benchmark_dca(price_series: pd.Series, dates: list, dca_amount: float):
-    """
-    Simula DCA simples em um único ativo (Benchmark).
-    """
+    """Simula DCA Benchmark."""
     if price_series.empty:
         return pd.Series()
     
-    # Alinha datas
     price_series = price_series.dropna()
-    
-    # Filtra datas válidas de aporte
     valid_dates = [d for d in dates if d in price_series.index or price_series.index.asof(d) is not None]
     
-    # Cria DF de fluxo
     df_flow = pd.DataFrame(index=price_series.index)
     df_flow['Price'] = price_series
     df_flow['Units'] = 0.0
-    df_flow['Cash_Flow'] = 0.0
     
     current_units = 0.0
     
     for d in valid_dates:
-        # Acha data mais próxima se necessário
         idx = price_series.index.asof(d)
         if idx is not None:
             price = price_series.loc[idx]
             if price > 0:
                 buy_units = dca_amount / price
-                # Registra no dia
                 if idx in df_flow.index:
-                    df_flow.at[idx, 'Cash_Flow'] += dca_amount
                     current_units += buy_units
                     df_flow.at[idx, 'Units'] = current_units
     
-    # Propaga quantidade de unidades (buy & hold)
-    # Primeiro, ajusta a coluna Units para ter valores apenas nos dias de compra
-    # O loop acima já colocou o acumulado NO DIA da compra.
-    # Agora precisamos fazer ffill para os dias entre compras.
-    
-    # Mas a lógica acima sobrescreve. Vamos simplificar:
-    # Cria Series de unidades acumuladas apenas nos dias de aporte
     units_series = df_flow['Units'].replace(0, np.nan).ffill().fillna(0)
-    
-    # Valor da carteira = Unidades Acumuladas * Preço Atual
     equity_curve = units_series * df_flow['Price']
     
     return equity_curve[equity_curve > 0]
@@ -474,7 +497,7 @@ def run_benchmark_dca(price_series: pd.Series, dates: list, dca_amount: float):
 # ==============================================================================
 
 def main():
-    st.title("🧪 Quant Factor Lab: Pro v3.1 (Benchmark Ed.)")
+    st.title("🧪 Quant Factor Lab: Pro v3.2 (Fixed)")
     st.markdown("""
     **Otimização Multifator Institucional**
     * **Ranking Atual:** Dados da API Brapi.dev (Value, Quality, Momentum).
@@ -526,8 +549,13 @@ def main():
             # 2. Dados Fundamentais
             status.write("🔍 Consultando Fundamentos Atuais (Brapi.dev)...")
             fundamentals = fetch_fundamentals_brapi(raw_tickers, BRAPI_TOKEN)
+            
             if not fundamentals.empty:
+                # Alinha index para .SA para dar match com preços
                 fundamentals.index = [f"{t}.SA" for t in fundamentals.index]
+                status.write(f"✅ Fundamentos carregados para {len(fundamentals)} ativos.")
+            else:
+                status.write("⚠️ Atenção: Falha ao carregar fundamentos. Usando apenas Momentum.")
 
             # 3. Cálculo do RANKING ATUAL
             status.write("🧮 Calculando Scores Atuais...")
@@ -537,6 +565,7 @@ def main():
                 curr_val = compute_value_robust(fundamentals)
                 curr_qual = compute_quality_score(fundamentals)
             else:
+                # Fallback se não tiver fundamentos
                 curr_val = pd.Series(0, index=prices.columns)
                 curr_qual = pd.Series(0, index=prices.columns)
 
@@ -573,9 +602,7 @@ def main():
         # DASHBOARD & BENCHMARKS
         # ==============================================================================
         
-        # Gera dados para os Benchmarks (Simulação de DCA neles também)
         bench_curves = {}
-        # Recupera as datas exatas usadas no backtest para sincronia
         if not dca_transactions.empty:
             dca_dates = sorted(list(set(pd.to_datetime(dca_transactions['Date']).tolist())))
         else:
@@ -585,25 +612,21 @@ def main():
             for bench_ticker in ['BOVA11.SA', 'DIVO11.SA']:
                 if bench_ticker in prices.columns:
                     bench_curve = run_benchmark_dca(prices[bench_ticker], dca_dates, dca_amount)
-                    # Alinha datas com a estratégia
                     common_idx = dca_curve.index.intersection(bench_curve.index)
                     if not common_idx.empty:
                         bench_curves[bench_ticker] = bench_curve.loc[common_idx]
 
-        # Definição das Tabs (Adicionada Tab 6 e Atualizada Tab 3)
         tab1, tab2, tab6, tab3, tab4, tab5 = st.tabs([
             "🏆 Ranking Atual", 
             "📈 Performance DCA", 
-            "🆚 Comparativo Benchmarks", # NOVA TAB
-            "💰 Histórico & Custódia", # ATUALIZADA
+            "🆚 Comparativo Benchmarks",
+            "💰 Histórico & Custódia",
             "🔮 Monte Carlo", 
             "📋 Dados Brutos"
         ])
 
-        # --- TAB 1: RANKING ATUAL ---
         with tab1:
-            st.subheader("🎯 Carteira Recomendada (Baseada em Dados Hoje)")
-            st.caption("Fatores: Momentum (Preço) + Valor (Brapi) + Qualidade (Brapi)")
+            st.subheader("🎯 Carteira Recomendada (Hoje)")
             
             top_picks = df_master.head(top_n).copy()
             latest_prices = prices.iloc[-1]
@@ -616,12 +639,14 @@ def main():
             top_picks['Alocação (R$)'] = (sug_weights * dca_amount)
             top_picks['Qtd Sugerida'] = (top_picks['Alocação (R$)'] / top_picks['Preço Atual'])
             
-            cols_show = ['Sector', 'Preço Atual', 'Composite_Score', 'Peso (%)', 'Alocação (R$)', 'Qtd Sugerida']
+            cols_show = ['Sector', 'Preço Atual', 'Composite_Score', 'Peso (%)', 'Alocação (R$)', 'Qtd Sugerida', 'Value', 'Quality']
             cols_final = [c for c in cols_show if c in top_picks.columns]
             
             display_df = top_picks[cols_final].style.format({
                 'Preço Atual': 'R$ {:.2f}',
                 'Composite_Score': '{:.2f}',
+                'Value': '{:.2f}',
+                'Quality': '{:.2f}',
                 'Peso (%)': '{:.1f}%',
                 'Alocação (R$)': 'R$ {:.0f}',
                 'Qtd Sugerida': '{:.0f}'
@@ -636,11 +661,8 @@ def main():
                 if 'Sector' in top_picks.columns:
                     st.plotly_chart(px.pie(top_picks, names='Sector', values='Peso (%)', title="Exposição Setorial"), use_container_width=True)
 
-        # --- TAB 2: PERFORMANCE DCA ---
         with tab2:
-            st.subheader("Simulação de Acumulação de Capital (DCA)")
-            st.warning("⚠️ Nota: Backtest utilizando apenas Momentum + Volatilidade para seleção histórica (sem Lookahead Bias).")
-            
+            st.subheader("Simulação de Acumulação (DCA)")
             if not dca_curve.empty:
                 end_val = dca_curve.iloc[-1,0]
                 unique_months = pd.to_datetime(dca_transactions['Date']).dt.to_period('M').nunique()
@@ -661,31 +683,23 @@ def main():
                 metrics = calculate_advanced_metrics(dca_curve['Strategy_DCA'])
                 st.json(metrics)
 
-        # --- TAB 6: COMPARATIVO BENCHMARKS (NOVO) ---
         with tab6:
-            st.subheader("🆚 Estratégia vs Benchmarks (Simulação DCA)")
-            st.caption(f"Comparação considerando aportes mensais de R$ {dca_amount} nas mesmas datas em todos os cenários.")
-            
+            st.subheader("🆚 Estratégia vs Benchmarks")
             if not dca_curve.empty and bench_curves:
                 df_compare = dca_curve.copy()
                 for b_name, b_series in bench_curves.items():
                     df_compare[b_name] = b_series
                 
                 df_compare = df_compare.ffill().dropna()
-
-                # Gráfico
                 fig_comp = px.line(df_compare, title="Evolução Patrimonial Comparativa")
                 st.plotly_chart(fig_comp, use_container_width=True)
                 
-                # Tabela de Métricas
                 comp_metrics = []
-                # Estratégia
                 m_strat = calculate_advanced_metrics(df_compare['Strategy_DCA'])
                 m_strat['Asset'] = '🚀 Estratégia'
                 m_strat['Saldo Final'] = df_compare['Strategy_DCA'].iloc[-1]
                 comp_metrics.append(m_strat)
                 
-                # Benchmarks
                 for b_name in bench_curves.keys():
                     if b_name in df_compare.columns:
                         m_bench = calculate_advanced_metrics(df_compare[b_name])
@@ -704,98 +718,56 @@ def main():
                         'Volatilidade': '{:.1%}',
                         'Sharpe': '{:.2f}',
                         'Max Drawdown': '{:.1%}'
-                    }).highlight_max(subset=['Saldo Final', 'Sharpe', 'CAGR'], color='#d4edda', axis=0)
-                      .highlight_min(subset=['Max Drawdown', 'Volatilidade'], color='#d4edda', axis=0),
+                    }).highlight_max(subset=['Saldo Final'], color='#d4edda'),
                     use_container_width=True
                 )
             else:
-                st.warning("Dados insuficientes para comparação de benchmarks.")
+                st.warning("Dados insuficientes para comparação.")
 
-        # --- TAB 3: HISTÓRICO & CUSTÓDIA (ATUALIZADO) ---
         with tab3:
             col_h1, col_h2 = st.columns([1, 1])
-            
             with col_h1:
                 st.subheader("💰 Posição Final (Backtest)")
-                st.caption("Carteira resultante da simulação histórica na última data disponível.")
-                
                 if dca_holdings:
-                    # Converte dict para DF
                     final_df = pd.DataFrame.from_dict(dca_holdings, orient='index', columns=['Qtd'])
-                    
-                    # Pega preços da última data disponível no backtest
                     last_date_idx = dca_curve.index[-1]
-                    
                     if last_date_idx in prices.index:
                         last_prices = prices.loc[last_date_idx]
                         final_df['Preço Fechamento'] = last_prices.reindex(final_df.index)
                         final_df['Valor Total (R$)'] = final_df['Qtd'] * final_df['Preço Fechamento']
-                        
                         total_nav = final_df['Valor Total (R$)'].sum()
                         final_df['Peso (%)'] = (final_df['Valor Total (R$)'] / total_nav) * 100
-                        
                         final_df = final_df.sort_values('Peso (%)', ascending=False)
                         
-                        st.dataframe(
-                            final_df.style.format({
-                                'Qtd': '{:.0f}',
-                                'Preço Fechamento': 'R$ {:.2f}',
-                                'Valor Total (R$)': 'R$ {:,.2f}',
-                                'Peso (%)': '{:.1f}%'
-                            }), 
-                            use_container_width=True
-                        )
+                        st.dataframe(final_df.style.format({'Qtd': '{:.0f}', 'Preço Fechamento': 'R$ {:.2f}', 'Valor Total (R$)': 'R$ {:,.2f}', 'Peso (%)': '{:.1f}%'}), use_container_width=True)
                         st.metric("Patrimônio em Custódia", f"R$ {total_nav:,.2f}")
-                    else:
-                        st.warning("Preços da data final não encontrados para avaliação.")
                 else:
-                    st.info("Nenhuma posição mantida no final do período.")
+                    st.info("Nenhuma posição mantida.")
 
             with col_h2:
                 st.subheader("📊 Alocação Final")
-                if dca_holdings and 'Valor Total (R$)' in final_df.columns:
+                if dca_holdings:
                      st.plotly_chart(px.pie(final_df, values='Valor Total (R$)', names=final_df.index, hole=0.4), use_container_width=True)
 
             st.divider()
-            st.subheader("📜 Diário de Transações Simulado")
             if not dca_transactions.empty:
-                df_trans = pd.DataFrame(dca_transactions)
-                df_trans['Date'] = pd.to_datetime(df_trans['Date']).dt.date
-                st.dataframe(df_trans.sort_values('Date', ascending=False), use_container_width=True)
+                st.dataframe(pd.DataFrame(dca_transactions).sort_values('Date', ascending=False), use_container_width=True)
 
-        # --- TAB 4: MONTE CARLO ---
         with tab4:
             st.subheader("Projeção Probabilística")
             if not dca_curve.empty:
                 daily_rets = dca_curve['Strategy_DCA'].pct_change().dropna()
                 mu = daily_rets.mean() * 252
                 sigma = daily_rets.std() * np.sqrt(252)
-                
-                st.write(f"Parâmetros estimados do Backtest: Retorno Anual ~{mu:.1%} | Volatilidade ~{sigma:.1%}")
-                
-                sim_df = run_monte_carlo(
-                    initial_balance=dca_curve.iloc[-1,0],
-                    monthly_contrib=dca_amount,
-                    mu_annual=mu,
-                    sigma_annual=sigma,
-                    years=mc_years
-                )
-                
-                last_row = sim_df.iloc[-1]
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Cenário Conservador (5%)", f"R$ {last_row['Pessimista (5%)']:,.0f}")
-                c2.metric("Cenário Base (50%)", f"R$ {last_row['Base (50%)']:,.0f}")
-                c3.metric("Cenário Otimista (95%)", f"R$ {last_row['Otimista (95%)']:,.0f}")
-                
-                st.plotly_chart(px.line(sim_df, title=f"Cone de Probabilidade - Próximos {mc_years} Anos"), use_container_width=True)
+                sim_df = run_monte_carlo(dca_curve.iloc[-1,0], dca_amount, mu, sigma, mc_years)
+                st.plotly_chart(px.line(sim_df, title=f"Cone de Probabilidade - {mc_years} Anos"), use_container_width=True)
 
-        # --- TAB 5: DADOS BRUTOS ---
         with tab5:
             st.subheader("Dados Fundamentais (Brapi Snapshot)")
             if not fundamentals.empty:
                 st.dataframe(fundamentals)
             else:
-                st.info("Nenhum dado fundamental carregado.")
+                st.error("Falha na recuperação de fundamentos. Verifique o token ou a conexão.")
 
 if __name__ == "__main__":
     main()
