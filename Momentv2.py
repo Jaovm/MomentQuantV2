@@ -393,7 +393,13 @@ def run_dca_backtest_robust(
     """
     all_prices = all_prices.ffill()
     dca_start = start_date + timedelta(days=30)
-    dates = all_prices.loc[dca_start:end_date].resample('MS').first().index.tolist()
+    
+    # --- CORREÇÃO AQUI ---
+    # O código anterior usava .resample('MS').first().index, o que gerava datas como '2018-04-01' (Domingo).
+    # Agora usamos .apply() para pegar o primeiro índice VÁLIDO (dia útil) de cada mês.
+    dates_series = all_prices.loc[dca_start:end_date].resample('MS').apply(lambda x: x.index[0] if not x.empty else None)
+    dates = dates_series.dropna().tolist()
+    # ---------------------
 
     if not dates or len(dates) < 2:
         return pd.DataFrame(), pd.DataFrame(), {}
@@ -410,7 +416,6 @@ def run_dca_backtest_robust(
         prices_historical = all_prices.loc[mom_start:eval_date]
         
         # 2. Screening (Apenas Momentum Residual neste modo robusto)
-        # Se tivéssemos banco de dados histórico de fundamentos, usaríamos aqui.
         res_mom = compute_residual_momentum_enhanced(prices_historical, lookback=12, skip=1)
         
         if res_mom.empty:
@@ -426,11 +431,18 @@ def run_dca_backtest_robust(
         target_weights = construct_portfolio(df_rank, risk_window, top_n, use_vol_target)
         
         # 4. Execução de Aportes e Rebalanceamento
-        # Assumimos que vendemos tudo e recompramos o novo portfólio ideal + aporte novo
-        # (Modelo simplificado sem custos de transação para focar na curva bruta)
-        
-        # Valor atual da carteira antes do aporte
-        current_date_prices = all_prices.loc[month_start]
+        # Tenta pegar preços do dia exato (agora garantido pela correção das datas)
+        try:
+            current_date_prices = all_prices.loc[month_start]
+        except KeyError:
+            # Fallback de segurança: se mesmo assim falhar, pega o dia seguinte mais próximo
+            # Isso protege contra feriados locais não padronizados
+            next_idx = all_prices.index[all_prices.index > month_start]
+            if next_idx.empty:
+                break
+            current_date_prices = all_prices.loc[next_idx[0]]
+            month_start = next_idx[0] # Atualiza data da transação
+
         
         total_portfolio_val = cash + dca_amount # Começa com caixa + novo aporte
         
@@ -452,8 +464,6 @@ def run_dca_backtest_robust(
                     qty = alloc_val / price
                     new_holdings[ticker] = qty
                     
-                    # Registro de "Compra" (apenas do novo aporte para simplificar log)
-                    # No mundo real registrariamos todas as movimentações
                     monthly_transactions.append({
                         'Date': month_start,
                         'Ticker': ticker,
@@ -471,7 +481,6 @@ def run_dca_backtest_robust(
         for d in valuation_dates:
             val = 0
             for t, q in portfolio_holdings.items():
-                # Usa preço do dia 'd'. Se faltar, ffill (já feito no all_prices)
                 p = all_prices.at[d, t]
                 if not np.isnan(p):
                     val += q * p
@@ -481,18 +490,11 @@ def run_dca_backtest_robust(
     portfolio_value = portfolio_value[portfolio_value > 0].sort_index()
     equity_curve = pd.DataFrame({'Strategy_DCA': portfolio_value})
     
-    # Adiciona benchmarks ao Dataframe final
-    if not equity_curve.empty:
-        common_idx = equity_curve.index
-        # Simula DCA no benchmark também para comparação justa
-        # (Isso é complexo, então vamos apenas indexar o benchmark ao retorno acumulado da estratégia)
-        # Opção mais simples: Retorno acumulado indexado
-        pass 
-
     transactions_df = pd.DataFrame(monthly_transactions)
-    final_holdings = portfolio_holdings # Do último dia
+    final_holdings = portfolio_holdings 
 
     return equity_curve, transactions_df, final_holdings
+
 
 # ==============================================================================
 # APP PRINCIPAL
