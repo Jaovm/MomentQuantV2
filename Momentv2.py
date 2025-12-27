@@ -13,13 +13,13 @@ import time
 # CONFIGURAÇÃO DA PÁGINA
 # ==============================================================================
 st.set_page_config(
-    page_title="Quant Factor Lab Pro v3.2 (Fix Brapi)",
+    page_title="Quant Factor Lab Pro v3.3 (Fixed)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # Constantes
-# DICA: Se este token falhar, cadastre-se na brapi.dev (grátis) e coloque seu próprio token aqui.
+# Token atualizado conforme solicitado
 BRAPI_TOKEN = "5gVedSQ928pxhFuTvBFPfr"
 
 # ==============================================================================
@@ -60,14 +60,14 @@ def fetch_price_data(tickers: list, start_date: str, end_date: str) -> pd.DataFr
 @st.cache_data(ttl=3600*6)
 def fetch_fundamentals_brapi(tickers: list, token: str) -> pd.DataFrame:
     """
-    Busca fundamentos ATUAIS via Brapi.dev com tratamento de erro robusto.
+    Busca fundamentos ATUAIS via Brapi.dev com autenticação via Header.
     """
     clean_tickers = [t for t in tickers if t not in ['BOVA11.SA', 'DIVO11.SA']]
     if not clean_tickers:
         return pd.DataFrame()
 
-    # Chunk size menor para evitar timeouts em conexões lentas ou limites da API
-    chunk_size = 10 
+    # Chunk size para evitar URLs muito longas
+    chunk_size = 15
     chunks = [clean_tickers[i:i + chunk_size] for i in range(0, len(clean_tickers), chunk_size)]
     
     fundamental_data = []
@@ -76,7 +76,6 @@ def fetch_fundamentals_brapi(tickers: list, token: str) -> pd.DataFrame:
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # Função auxiliar para garantir conversão segura de números
     def safe_float(val):
         if val is None: return np.nan
         try:
@@ -84,56 +83,67 @@ def fetch_fundamentals_brapi(tickers: list, token: str) -> pd.DataFrame:
         except (ValueError, TypeError):
             return np.nan
 
+    # Helper para buscar chaves em múltiplos locais do JSON (raiz ou módulos)
+    def get_nested(item, keys, default=None):
+        # Locais onde a Brapi costuma aninhar dados dependendo da query
+        sources = [item, item.get('defaultKeyStatistics', {}), item.get('summaryProfile', {}), item.get('financialData', {})]
+        for source in sources:
+            if not isinstance(source, dict): continue
+            for key in keys:
+                val = source.get(key)
+                if val is not None:
+                    return val
+        return default
+
+    # Headers de autenticação (Best Practice)
+    headers = {
+        "Authorization": f"Bearer {token}"
+    }
+
     for i, chunk in enumerate(chunks):
         status_text.text(f"Consultando Brapi API: Lote {i+1}/{len(chunks)}")
         ticker_str = ','.join(chunk)
         url = f"https://brapi.dev/api/quote/{ticker_str}"
         
-        # Adicionamos modules para tentar garantir que dados financeiros venham
+        # Parâmetros otimizados
         params = {
-            'token': token,
-            'fundamental': 'true',
-            'modules': 'summaryProfile,defaultKeyStatistics' 
+            'fundamental': 'true', # Garante retorno de dados financeiros
+            'modules': 'summaryProfile,defaultKeyStatistics,financialData' # Módulos extras
         }
         
         try:
-            response = requests.get(url, params=params, timeout=15)
+            response = requests.get(url, headers=headers, params=params, timeout=20)
             
             if response.status_code == 200:
                 data_json = response.json()
                 results = data_json.get('results', [])
                 
                 if not results:
-                    st.warning(f"Aviso: A Brapi retornou lista vazia para o lote: {chunk}")
+                    # Tenta fallback se a lista vier vazia mas sem erro HTTP
+                    pass
 
                 for item in results:
                     try:
                         symbol = item.get('symbol')
                         
-                        # Extração Segura
+                        # Extração Segura usando Helper e Múltiplas Chaves
                         price = safe_float(item.get('regularMarketPrice'))
                         market_cap = safe_float(item.get('marketCap'))
                         
-                        # Setor (Tenta raiz, senão tenta inferir)
+                        # Setor
                         sector = item.get('sector')
-                        if not sector or sector == 'Unknown':
-                            # Fallback simples
-                            sector = 'General'
+                        if not sector:
+                            sector = item.get('summaryProfile', {}).get('sector', 'General')
 
-                        # Value Metrics
-                        pe_ratio = safe_float(item.get('priceEarnings'))
-                        if np.isnan(pe_ratio):
-                            # Tenta buscar em chaves alternativas caso a estrutura mude
-                            pe_ratio = safe_float(item.get('trailingPE'))
-
-                        p_vp = safe_float(item.get('priceToBook'))
-                        ev_ebitda = safe_float(item.get('enterpriseValueToEBITDA'))
+                        # Value Metrics (Busca na raiz e sub-módulos)
+                        pe_ratio = safe_float(get_nested(item, ['priceEarnings', 'trailingPE']))
+                        p_vp = safe_float(get_nested(item, ['priceToBook', 'priceToBookRatio']))
+                        ev_ebitda = safe_float(get_nested(item, ['enterpriseValueToEBITDA', 'enterpriseToEbitda']))
                         
                         # Quality Metrics
-                        roe = safe_float(item.get('returnOnEquity'))
-                        net_margin = safe_float(item.get('profitMargin'))
+                        roe = safe_float(get_nested(item, ['returnOnEquity', 'roe']))
+                        net_margin = safe_float(get_nested(item, ['profitMargin', 'netMargin']))
                         
-                        # Monta o objeto
                         fundamental_data.append({
                             'ticker': symbol,
                             'sector': sector,
@@ -146,30 +156,25 @@ def fetch_fundamentals_brapi(tickers: list, token: str) -> pd.DataFrame:
                             'Net_Margin': net_margin,
                         })
                     except Exception as e_parse:
-                        # Log discreto para não poluir a UI, mas útil se tudo falhar
                         print(f"Erro parse {item.get('symbol', 'Unknown')}: {e_parse}")
                         failed_tickers.append(item.get('symbol', 'Unknown'))
             else:
-                st.error(f"Erro Brapi API (Lote {i+1}): Status {response.status_code}. Verifique o Token.")
-                if response.status_code == 401 or response.status_code == 403:
-                    st.warning("⚠️ Seu Token da Brapi parece inválido ou expirado. Atualize no código.")
+                st.error(f"Erro Brapi API (Lote {i+1}): Status {response.status_code}. Msg: {response.text}")
                 
         except Exception as e_req:
             st.warning(f"Erro de conexão com Brapi no lote {i+1}: {e_req}")
         
         progress_bar.progress((i + 1) / len(chunks))
-        time.sleep(0.2) # Rate limit handling
+        time.sleep(0.1) 
 
     progress_bar.empty()
     status_text.empty()
     
     if not fundamental_data:
-        st.warning("⚠️ Nenhum dado fundamentalista foi recuperado. Verifique os Tickers e o Token.")
+        st.warning("⚠️ Nenhum dado fundamentalista foi recuperado. Verifique se os tickers estão corretos (ex: PETR4, VALE3).")
         return pd.DataFrame()
         
     df = pd.DataFrame(fundamental_data)
-    
-    # Remove duplicatas se houver
     df = df.drop_duplicates(subset=['ticker'])
     df = df.set_index('ticker')
     
@@ -188,7 +193,8 @@ def fetch_fundamentals_brapi(tickers: list, token: str) -> pd.DataFrame:
 def compute_residual_momentum_enhanced(price_df: pd.DataFrame, lookback=12, skip=1) -> pd.Series:
     """Residual Momentum (Blitz) com Volatility Scaling."""
     df = price_df.copy()
-    monthly = df.resample('ME').last()
+    # Ajuste para garantir resampling mensal correto no Pandas novo
+    monthly = df.resample('ME').last() 
     rets = monthly.pct_change().dropna()
     
     if 'BOVA11.SA' not in rets.columns: return pd.Series(dtype=float)
@@ -238,13 +244,14 @@ def compute_value_robust(fund_df: pd.DataFrame) -> pd.Series:
     scores = pd.DataFrame(index=fund_df.index)
     
     def invert_metric(series):
+        # Inverte métricas onde "menor é melhor" (ex: P/L) para criar Score
+        # Adiciona verificação de nulos
         return 1.0 / series.replace(0, np.nan)
 
     if 'PE' in fund_df: scores['Earnings_Yield'] = invert_metric(fund_df['PE'])
     if 'P_VP' in fund_df: scores['Book_Yield'] = invert_metric(fund_df['P_VP'])
     if 'EV_EBITDA' in fund_df: scores['EBITDA_Yield'] = invert_metric(fund_df['EV_EBITDA'])
 
-    # Se não houver métricas de valor, retorna 0
     if scores.empty or scores.dropna(how='all').empty:
         return pd.Series(0, index=fund_df.index, name="Value_Score")
 
@@ -293,6 +300,8 @@ def calculate_advanced_metrics(prices_series: pd.Series, risk_free_rate_annual: 
         return {}
     
     daily_rets = prices_series.pct_change().dropna()
+    if daily_rets.empty: return {}
+    
     total_ret = (prices_series.iloc[-1] / prices_series.iloc[0]) - 1
     days = (prices_series.index[-1] - prices_series.index[0]).days
     cagr = (1 + total_ret)**(365/days) - 1 if days > 0 else 0
@@ -304,7 +313,7 @@ def calculate_advanced_metrics(prices_series: pd.Series, risk_free_rate_annual: 
     
     downside_rets = excess_rets[excess_rets < 0]
     downside_std = downside_rets.std() * np.sqrt(252)
-    sortino = (excess_rets.mean() * 252) / downside_std if downside_std > 0 else 0
+    sortino = (excess_rets.mean() * 252) / downside_std if (downside_std > 0 and not np.isnan(downside_std)) else 0
     
     cum_rets = (1 + daily_rets).cumprod()
     peak = cum_rets.cummax()
@@ -329,9 +338,16 @@ def calculate_advanced_metrics(prices_series: pd.Series, risk_free_rate_annual: 
 # ==============================================================================
 
 def run_monte_carlo(initial_balance, monthly_contrib, mu_annual, sigma_annual, years, simulations=1000):
-    months = years * 12
+    if np.isnan(mu_annual) or np.isnan(sigma_annual):
+        return pd.DataFrame()
+        
+    months = int(years * 12)
     dt = 1/12
     drift = (mu_annual - 0.5 * sigma_annual**2) * dt
+    
+    # Prevenção de erro em caso de sigma zero
+    if sigma_annual == 0: sigma_annual = 0.01
+        
     shock = sigma_annual * np.sqrt(dt) * np.random.normal(0, 1, (months, simulations))
     monthly_returns = np.exp(drift + shock) - 1
     
@@ -360,11 +376,19 @@ def construct_portfolio(ranked_df: pd.DataFrame, prices: pd.DataFrame, top_n: in
     if not selected: return pd.Series()
 
     if vol_target:
-        recent_rets = prices[selected].pct_change().tail(63) 
+        # Pega preços apenas dos selecionados
+        valid_sel = [s for s in selected if s in prices.columns]
+        if not valid_sel: return pd.Series()
+        
+        recent_rets = prices[valid_sel].pct_change().tail(63) 
         vols = recent_rets.std() * (252**0.5)
         vols = vols.replace(0, 1e-6)
         raw_weights_inv = 1 / vols
-        weights = raw_weights_inv / raw_weights_inv.sum() 
+        
+        if raw_weights_inv.sum() == 0:
+            weights = pd.Series(1.0/len(valid_sel), index=valid_sel)
+        else:
+            weights = raw_weights_inv / raw_weights_inv.sum() 
     else:
         weights = pd.Series(1.0/len(selected), index=selected)
     return weights.sort_values(ascending=False)
@@ -374,6 +398,7 @@ def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: fl
     all_prices = all_prices.ffill()
     dca_start = start_date + timedelta(days=30)
     
+    # Resample mensal para identificar datas de aporte
     market_calendar = pd.Series(all_prices.index, index=all_prices.index)
     dates_series = market_calendar.loc[dca_start:end_date].resample('MS').first()
     dates = dates_series.dropna().tolist()
@@ -390,10 +415,15 @@ def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: fl
         # 1. Definição das janelas
         eval_date = month_start - timedelta(days=1)
         mom_start = month_start - timedelta(days=365*3) 
-        prices_historical = all_prices.loc[mom_start:eval_date]
         
+        # Filtra histórico disponível até o momento da decisão
+        prices_historical = all_prices.loc[:eval_date]
+        prices_window = prices_historical.loc[mom_start:]
+        
+        if prices_window.empty: continue
+
         # 2. Screening
-        res_mom = compute_residual_momentum_enhanced(prices_historical, lookback=12, skip=1)
+        res_mom = compute_residual_momentum_enhanced(prices_window, lookback=12, skip=1)
         
         if res_mom.empty:
             continue
@@ -406,24 +436,30 @@ def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: fl
         risk_window = prices_historical.tail(90)
         target_weights = construct_portfolio(df_rank, risk_window, top_n, use_vol_target)
         
-        # 4. Execução
+        # 4. Execução (Compra no dia month_start)
         try:
-            current_date_prices = all_prices.loc[month_start]
+            # Se a data exata não existir (feriado), pega o próximo dia útil
+            if month_start not in all_prices.index:
+                next_days = all_prices.index[all_prices.index > month_start]
+                if next_days.empty: break
+                exec_date = next_days[0]
+            else:
+                exec_date = month_start
+                
+            current_date_prices = all_prices.loc[exec_date]
         except KeyError:
-            next_idx = all_prices.index[all_prices.index > month_start]
-            if next_idx.empty:
-                break
-            current_date_prices = all_prices.loc[next_idx[0]]
-            month_start = next_idx[0] 
+            continue
 
-        total_portfolio_val = cash + dca_amount
-        
+        # Valor da carteira atual (Mark to Market)
+        current_portfolio_val_mtm = cash
         for t, qtd in portfolio_holdings.items():
-            if t in current_date_prices:
-                price = current_date_prices[t]
-                if not np.isnan(price):
-                    total_portfolio_val += qtd * price
+            if t in current_date_prices and not np.isnan(current_date_prices[t]):
+                current_portfolio_val_mtm += qtd * current_date_prices[t]
         
+        # Adiciona aporte
+        total_portfolio_val = current_portfolio_val_mtm + dca_amount
+        
+        # Nova alocação
         new_holdings = {}
         
         for ticker, weight in target_weights.items():
@@ -435,7 +471,7 @@ def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: fl
                     new_holdings[ticker] = qty
                     
                     monthly_transactions.append({
-                        'Date': month_start,
+                        'Date': exec_date,
                         'Ticker': ticker,
                         'Action': 'Rebalance/Buy',
                         'Price': price,
@@ -444,9 +480,15 @@ def run_dca_backtest_robust(all_prices: pd.DataFrame, top_n: int, dca_amount: fl
         
         portfolio_holdings = new_holdings
         
-        # 5. MTM
-        next_month = dates[i+1] if i < len(dates)-1 else end_date
-        valuation_dates = all_prices.loc[month_start:next_month].index
+        # 5. MTM Diário até o próximo rebalanceamento
+        next_rebalance = dates[i+1] if i < len(dates)-1 else end_date
+        
+        # Ajuste para não incluir datas futuras além do índice de preços
+        valid_end = min(next_rebalance, all_prices.index[-1])
+        
+        if exec_date > valid_end: continue
+            
+        valuation_dates = all_prices.loc[exec_date:valid_end].index
         
         for d in valuation_dates:
             val = 0
@@ -469,7 +511,6 @@ def run_benchmark_dca(price_series: pd.Series, dates: list, dca_amount: float):
         return pd.Series()
     
     price_series = price_series.dropna()
-    valid_dates = [d for d in dates if d in price_series.index or price_series.index.asof(d) is not None]
     
     df_flow = pd.DataFrame(index=price_series.index)
     df_flow['Price'] = price_series
@@ -477,18 +518,25 @@ def run_benchmark_dca(price_series: pd.Series, dates: list, dca_amount: float):
     
     current_units = 0.0
     
-    for d in valid_dates:
-        idx = price_series.index.asof(d)
-        if idx is not None:
-            price = price_series.loc[idx]
+    # Processa compras
+    sorted_dates = sorted(dates)
+    
+    for d in sorted_dates:
+        # Acha data válida no índice
+        idx_loc = price_series.index.asof(d)
+        if idx_loc is not None:
+            price = price_series.loc[idx_loc]
             if price > 0:
                 buy_units = dca_amount / price
-                if idx in df_flow.index:
-                    current_units += buy_units
-                    df_flow.at[idx, 'Units'] = current_units
+                # Registra acumulação a partir dessa data
+                if idx_loc in df_flow.index:
+                    df_flow.at[idx_loc, 'Add_Units'] = buy_units
+
+    # Soma cumulativa de unidades
+    df_flow['Add_Units'] = df_flow.get('Add_Units', pd.Series(0, index=df_flow.index)).fillna(0)
+    df_flow['Cumulative_Units'] = df_flow['Add_Units'].cumsum()
     
-    units_series = df_flow['Units'].replace(0, np.nan).ffill().fillna(0)
-    equity_curve = units_series * df_flow['Price']
+    equity_curve = df_flow['Cumulative_Units'] * df_flow['Price']
     
     return equity_curve[equity_curve > 0]
 
@@ -497,11 +545,11 @@ def run_benchmark_dca(price_series: pd.Series, dates: list, dca_amount: float):
 # ==============================================================================
 
 def main():
-    st.title("🧪 Quant Factor Lab: Pro v3.2 (Fixed)")
+    st.title("🧪 Quant Factor Lab: Pro v3.3 (Fixed)")
     st.markdown("""
     **Otimização Multifator Institucional**
     * **Ranking Atual:** Dados da API Brapi.dev (Value, Quality, Momentum).
-    * **Backtest Robusto:** Simulação histórica sem viés.
+    * **Backtest Robusto:** Simulação histórica sem viés (Point-in-Time simulado).
     """)
 
     st.sidebar.header("1. Universo e Dados")
@@ -603,6 +651,7 @@ def main():
         # ==============================================================================
         
         bench_curves = {}
+        # Garante datas únicas e ordenadas
         if not dca_transactions.empty:
             dca_dates = sorted(list(set(pd.to_datetime(dca_transactions['Date']).tolist())))
         else:
@@ -612,6 +661,7 @@ def main():
             for bench_ticker in ['BOVA11.SA', 'DIVO11.SA']:
                 if bench_ticker in prices.columns:
                     bench_curve = run_benchmark_dca(prices[bench_ticker], dca_dates, dca_amount)
+                    # Alinha índices
                     common_idx = dca_curve.index.intersection(bench_curve.index)
                     if not common_idx.empty:
                         bench_curves[bench_ticker] = bench_curve.loc[common_idx]
@@ -722,7 +772,7 @@ def main():
                     use_container_width=True
                 )
             else:
-                st.warning("Dados insuficientes para comparação.")
+                st.warning("Dados insuficientes para comparação ou período muito curto.")
 
         with tab3:
             col_h1, col_h2 = st.columns([1, 1])
@@ -751,16 +801,21 @@ def main():
 
             st.divider()
             if not dca_transactions.empty:
+                st.subheader("Histórico de Transações")
                 st.dataframe(pd.DataFrame(dca_transactions).sort_values('Date', ascending=False), use_container_width=True)
 
         with tab4:
             st.subheader("Projeção Probabilística")
             if not dca_curve.empty:
                 daily_rets = dca_curve['Strategy_DCA'].pct_change().dropna()
-                mu = daily_rets.mean() * 252
-                sigma = daily_rets.std() * np.sqrt(252)
-                sim_df = run_monte_carlo(dca_curve.iloc[-1,0], dca_amount, mu, sigma, mc_years)
-                st.plotly_chart(px.line(sim_df, title=f"Cone de Probabilidade - {mc_years} Anos"), use_container_width=True)
+                if not daily_rets.empty:
+                    mu = daily_rets.mean() * 252
+                    sigma = daily_rets.std() * np.sqrt(252)
+                    sim_df = run_monte_carlo(dca_curve.iloc[-1,0], dca_amount, mu, sigma, mc_years)
+                    if not sim_df.empty:
+                        st.plotly_chart(px.line(sim_df, title=f"Cone de Probabilidade - {mc_years} Anos"), use_container_width=True)
+                    else:
+                        st.warning("Erro ao calcular Monte Carlo (dados insuficientes).")
 
         with tab5:
             st.subheader("Dados Fundamentais (Brapi Snapshot)")
