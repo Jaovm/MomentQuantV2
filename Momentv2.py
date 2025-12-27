@@ -395,9 +395,14 @@ def run_dca_backtest_robust(
     dca_start = start_date + timedelta(days=30)
     
     # --- CORREÇÃO AQUI ---
-    # O código anterior usava .resample('MS').first().index, o que gerava datas como '2018-04-01' (Domingo).
-    # Agora usamos .apply() para pegar o primeiro índice VÁLIDO (dia útil) de cada mês.
-    dates_series = all_prices.loc[dca_start:end_date].resample('MS').apply(lambda x: x.index[0] if not x.empty else None)
+    # Criamos uma Series separada contendo apenas o index (datas)
+    # Isso evita que o resample retorne um DataFrame (que causa o erro .tolist())
+    market_calendar = pd.Series(all_prices.index, index=all_prices.index)
+    
+    # Agora o .apply vai operar sobre os valores de data, retornando uma Series de datas
+    dates_series = market_calendar.loc[dca_start:end_date].resample('MS').first()
+    
+    # Agora .tolist() funciona pois dates_series é uma Series
     dates = dates_series.dropna().tolist()
     # ---------------------
 
